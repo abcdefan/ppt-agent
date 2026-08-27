@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.DS_Store
+
+# Virtual environments
+.venv
+
+# 配置文件
+.env
+.env.example
+
+# ppt生成结果
+/workspace/
+/tests/
+
+# 面试文件
+/面试.md
