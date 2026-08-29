@@ -2,7 +2,7 @@
 
 这个文件只负责“把已经定义好的 Node 串成图”：
 
-    START -> Intent Router -> {Chat: Reply | Create: PPT Subgraph -> Reply} -> END
+    START -> Intent Router -> {Chat | Create Init | Edit Target} -> 对应 PPT 子图 -> Reply
 
 父图只负责意图分流和统一回复；PPT 专家与具体执行顺序全部封装在子图中。
 """
@@ -12,72 +12,146 @@ import logging
 from langchain_core.language_models import BaseChatModel
 from langgraph.graph import END, START, StateGraph
 
-from app.agents.workflow.reply_node import REPLY, build_reply_node
-from app.agents.workflow.router_node import INTENT_ROUTER, build_intent_router_node
+from app.agents.workflow.nodes.ppt_context.initialize import (
+    INITIALIZE_PPT_NODE,
+    build_initialize_node,
+)
+from app.agents.workflow.nodes.ppt_context.resolve import (
+    RESOLVE_TARGET_PPT_NODE,
+    build_resolve_node,
+    route_after_resolution,
+)
+from app.agents.workflow.nodes.reply import REPLY_NODE, build_reply_node
+from app.agents.workflow.nodes.router import (
+    INTENT_ROUTER_NODE,
+    build_intent_router_node,
+)
 from app.agents.workflow.state import WorkflowState
 from app.agents.workflow.subgraphs import (
     DEBUG_PPT_CREATION_SUBGRAPH,
     PPT_CREATION_SUBGRAPH,
+    PPT_EDIT_SUBGRAPH,
     build_debug_ppt_creation_subgraph,
     build_ppt_creation_subgraph,
+    build_ppt_edit_subgraph,
 )
+from app.context import PptRecordStore, SessionStateStore
 from app.core.config import settings
+from app.services import PptContextService
 
 logger = logging.getLogger(__name__)
 
 
 CREATE_ROUTE = "create"
+EDIT_ROUTE = "edit"
+TARGET_RESOLVED = "resolved"
+TARGET_ERROR = "error"
 
 
 def route_after_intent(state: WorkflowState) -> str:
-    """普通对话直接回复；创建任务直接进入 PPT Workflow 子图。"""
-    return REPLY if state.get("intent") == "chat" else CREATE_ROUTE
+    """普通对话直接回复；Create/Edit 先准备各自的 PPT 上下文。"""
+    intent = state.get("intent")
+    if intent == "create":
+        return CREATE_ROUTE
+    if intent == "edit":
+        return EDIT_ROUTE
+    return REPLY_NODE
 
 
-def build_workflow_graph(llm: BaseChatModel, intent_router, chat_responder):
+def build_workflow_graph(
+    llm: BaseChatModel,
+    intent_router,
+    chat_responder,
+    session_store: SessionStateStore | None = None,
+    ppt_record_store: PptRecordStore | None = None,
+    ppt_context_service: PptContextService | None = None,
+    creation_subgraph=None,
+):
     """创建只负责 Intent 分流、PPT 子图挂载与统一回复的父图。"""
     # 1. 定义整张图共享的 State 结构。
     graph_builder = StateGraph(WorkflowState)
+    session_store = session_store or SessionStateStore()
+    ppt_record_store = ppt_record_store or PptRecordStore()
 
-    # 2. 创建入口路由、统一回复和可切换的 PPT Workflow 子图。
-    graph_builder.add_node(INTENT_ROUTER, build_intent_router_node(intent_router))
-    graph_builder.add_node(REPLY, build_reply_node(chat_responder))
+    # 2. 创建入口路由、统一回复以及 Create/Edit 各自的子图。
+    graph_builder.add_node(INTENT_ROUTER_NODE, build_intent_router_node(intent_router))
+    graph_builder.add_node(REPLY_NODE, build_reply_node(chat_responder))
+    graph_builder.add_node(
+        INITIALIZE_PPT_NODE,
+        build_initialize_node(
+            session_store,
+            ppt_record_store,
+            ppt_context_service,
+        ),
+    )
+    graph_builder.add_node(
+        RESOLVE_TARGET_PPT_NODE,
+        build_resolve_node(
+            session_store,
+            ppt_record_store,
+            ppt_context_service,
+        ),
+    )
     if settings.agent_ppt_subgraph_mode == "debug":
         creation_subgraph_name = DEBUG_PPT_CREATION_SUBGRAPH
-        creation_subgraph = build_debug_ppt_creation_subgraph(llm)
-        logger.warning(
-            "启用危险 Debug PPT 子图：Image/Chart 会直接并行写同一文件"
-        )
+        if creation_subgraph is None:
+            creation_subgraph = build_debug_ppt_creation_subgraph(
+                llm,
+                ppt_context_service,
+            )
+        logger.warning("启用危险 Debug PPT 子图：Image/Chart 会直接并行写同一文件")
     else:
         creation_subgraph_name = PPT_CREATION_SUBGRAPH
-        creation_subgraph = build_ppt_creation_subgraph(llm)
+        if creation_subgraph is None:
+            creation_subgraph = build_ppt_creation_subgraph(
+                llm,
+                ppt_context_service,
+            )
+    edit_subgraph = build_ppt_edit_subgraph(
+        llm,
+        ppt_context_service,
+    )
 
-    # 3. 父图只把编译后的子图当成一个 Node，不注册任何 Specialist。
+    # 3. 父图只把编译后的子图当成 Node，不注册任何 Specialist。
     graph_builder.add_node(creation_subgraph_name, creation_subgraph)
+    graph_builder.add_node(PPT_EDIT_SUBGRAPH, edit_subgraph)
 
     # 4. 整张图先做意图识别。
-    graph_builder.add_edge(START, INTENT_ROUTER)
+    graph_builder.add_edge(START, INTENT_ROUTER_NODE)
     graph_builder.add_conditional_edges(
-        INTENT_ROUTER,
+        INTENT_ROUTER_NODE,
         route_after_intent,
         {
-            REPLY: REPLY,
-            CREATE_ROUTE: creation_subgraph_name,
+            REPLY_NODE: REPLY_NODE,
+            CREATE_ROUTE: INITIALIZE_PPT_NODE,
+            EDIT_ROUTE: RESOLVE_TARGET_PPT_NODE,
         },
     )
 
-    # 5. Chat 与 Create 最终汇入同一个 Reply Node。
-    graph_builder.add_edge(REPLY, END)
-    graph_builder.add_edge(creation_subgraph_name, REPLY)
+    graph_builder.add_edge(INITIALIZE_PPT_NODE, creation_subgraph_name)
+    graph_builder.add_conditional_edges(
+        RESOLVE_TARGET_PPT_NODE,
+        route_after_resolution,
+        {
+            TARGET_RESOLVED: PPT_EDIT_SUBGRAPH,
+            TARGET_ERROR: REPLY_NODE,
+        },
+    )
+
+    # 5. Chat、Create 与 Edit 最终汇入同一个 Reply Node。
+    graph_builder.add_edge(REPLY_NODE, END)
+    graph_builder.add_edge(creation_subgraph_name, REPLY_NODE)
+    graph_builder.add_edge(PPT_EDIT_SUBGRAPH, REPLY_NODE)
 
     # compile() 之后得到真正可以 ainvoke()/astream_events() 的图。
     graph = graph_builder.compile()
     logger.info(
-        "Workflow 父图构建完成: %s -> %s -> {%s | %s} -> %s",
+        "Workflow 父图构建完成: %s -> %s -> {%s | %s | %s} -> %s",
         START,
-        INTENT_ROUTER,
-        REPLY,
+        INTENT_ROUTER_NODE,
+        REPLY_NODE,
         creation_subgraph_name,
+        PPT_EDIT_SUBGRAPH,
         END,
     )
     return graph

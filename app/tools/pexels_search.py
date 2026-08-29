@@ -165,7 +165,7 @@ async def prepare_image_operation(
 ) -> str:
     """准备一项 PPT 配图操作，但不直接修改 PPT 文件。
 
-    返回的 operation 会由 Workflow 的确定性 edit_node 汇总并统一写入。
+    返回的 operation 会由 Workflow 的确定性 ppt_writer_node 汇总并统一写入。
 
     Args:
         filename: 目标 PPT 文件名，仅用于标识操作目标

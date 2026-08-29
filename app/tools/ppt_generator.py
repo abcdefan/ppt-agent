@@ -101,9 +101,13 @@ async def generate_ppt(
         prs.slide_width = SLIDE_WIDTH
         prs.slide_height = SLIDE_HEIGHT
 
-        for idx, slide_data in enumerate(slides_data):
-            if not isinstance(slide_data, dict):
-                continue
+        generated_slides = [
+            slide_data for slide_data in slides_data if isinstance(slide_data, dict)
+        ]
+        if not generated_slides:
+            return "错误：slides 中没有可生成的页面对象"
+
+        for slide_data in generated_slides:
             title = slide_data.get("title", "")
             bullets = slide_data.get("bullets", [])
             layout_hint = slide_data.get("layout_hint", "content")
@@ -129,10 +133,13 @@ async def generate_ppt(
         result = {
             "success": True,
             "file_path": str(file_path),
-            "slides_count": len(slides_data),
-            "message": f"PPT 生成成功: {filename}，共 {len(slides_data)} 页",
+            "slides_count": len(generated_slides),
+            # Content Node 会把这份实际用于生成 PPT 的结构化页面内容写回
+            # WorkflowState，供 Enhancement Planner 和后续编辑阶段读取。
+            "slides_manifest": generated_slides,
+            "message": f"PPT 生成成功: {filename}，共 {len(generated_slides)} 页",
         }
-        logger.info("PPT 生成成功: %s, %d 页", filename, len(slides_data))
+        logger.info("PPT 生成成功: %s, %d 页", filename, len(generated_slides))
         return json.dumps(result, ensure_ascii=False)
 
     except json.JSONDecodeError as e:

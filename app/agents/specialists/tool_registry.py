@@ -17,8 +17,8 @@ from app.tools import (
 )
 
 AgentRole = Literal[
-    "outline",
     "research",
+    "outline",
     "content",
     "image",
     "chart",
@@ -26,8 +26,8 @@ AgentRole = Literal[
 ]
 
 AGENT_ROLES: tuple[AgentRole, ...] = (
-    "outline",
     "research",
+    "outline",
     "content",
     "image",
     "chart",

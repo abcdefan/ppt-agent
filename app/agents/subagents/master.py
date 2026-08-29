@@ -4,6 +4,7 @@ import logging
 import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from uuid import uuid4
 
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -11,7 +12,12 @@ from langgraph.errors import GraphRecursionError
 
 from app.agents.common.llm import build_llm, build_summary_llm
 from app.agents.router import ChatResponder, IntentRouterService, RouteContext
-from app.context import SessionState, SessionStateStore, SummaryBufferMemory
+from app.context import (
+    PptRecord,
+    PptRecordStore,
+    SessionStateStore,
+    SummaryBufferMemory,
+)
 from app.agents.subagents.delegation_tools import build_delegation_tools
 from app.agents.subagents.streaming import stream_subagent_events
 from app.core.config import settings
@@ -41,22 +47,20 @@ SYSTEM_PROMPT = """
 - chart_agent_tool：为已有 PPT 添加数据图表。
 - beautify_agent_tool：对已有 PPT 进行布局和视觉美化。
 
-完整创建 PPT 时通常按照以下顺序协作：
-1. 调用 outline_agent_tool 生成大纲。
-2. 如果主题涉及最新数据、市场、趋势、政策、竞品、人物事件、外部案例、
-   可核验事实或用户明确要求来源，调用 research_agent_tool；纯创意、个人材料
-   改写、模板排版和故事文案可跳过，边界不确定时默认调研。
+完整创建 PPT 时严格按照以下顺序协作：
+1. 调用 research_agent_tool，根据用户原始需求完成联网调研。
+2. 将用户需求和调研报告全文交给 outline_agent_tool 生成大纲。
 3. 将主题、风格、页数、完整大纲和调研报告全文交给 content_agent_tool 生成 PPTX。
 4. 根据用户需求按需调用 image_agent_tool 和 chart_agent_tool。
 5. 在其他文件修改完成后调用 beautify_agent_tool 做最终美化。
 
 规则：
 - 调用下一个子 Agent 时，必须传递它需要的上游结果。
-- research_agent_tool 需要完整大纲；content_agent_tool 需要完整大纲和已经执行的
-  调研报告；image_agent_tool、chart_agent_tool 和
+- research_agent_tool 需要用户原始需求；outline_agent_tool 需要完整调研报告；
+  content_agent_tool 需要完整大纲和已经执行的调研报告；image_agent_tool、chart_agent_tool 和
   beautify_agent_tool 需要真实 PPT 文件名。
-- research 返回 unavailable 时仍继续 content，但必须告诉 content 不得猜测外部
-  数据或来源；同一轮不要重复调用 research。
+- research 返回 unavailable 时仍继续 outline 和 content，但必须告诉它们不得猜测
+  外部数据或来源；同一轮不要重复调用 research。
 - 不要编造大纲、工具结果或文件名。
 - 子 Agent 返回失败时，应说明失败原因，不要假装任务已经完成。
 - 用户只需要部分能力时，只调用相关子 Agent，不必执行完整流程。
@@ -92,13 +96,17 @@ def _extract_ppt_filename(result: dict) -> str | None:
     return None
 
 
-def _build_business_context(state: SessionState, intent: str) -> SystemMessage:
+def _build_business_context(
+    record: PptRecord,
+    intent: str,
+) -> SystemMessage:
     return SystemMessage(
         content=(
             "[当前会话业务状态]\n"
             f"本轮入口意图：{intent}\n"
-            f"此前活动 PPT：{state.active_ppt_filename or '无'}\n"
-            f"默认风格：{state.style}\n"
+            f"目标 PPT ID：{record.ppt_id}\n"
+            f"目标 PPT 文件：{record.filename or '尚未生成'}\n"
+            f"默认风格：{record.style}\n"
             "本轮 intent=create 表示必须新建 PPT，不要把此前活动文件当作本轮产物。"
         )
     )
@@ -111,6 +119,7 @@ class MasterAgent:
         self.llm = build_llm()
         self.memory = SummaryBufferMemory(summary_llm=build_summary_llm())
         self.state_store = SessionStateStore()
+        self.ppt_record_store = PptRecordStore()
         self.intent_router = IntentRouterService(self.llm)
         self.chat_responder = ChatResponder(self.llm)
         self.recursion_limit = settings.agent_multi_recursion_limit
@@ -139,12 +148,44 @@ class MasterAgent:
             self.recursion_limit,
         )
 
+    async def _prepare_ppt_record(
+        self,
+        *,
+        intent: str,
+        session_id: str,
+        session_state,
+        requested_ppt_id: str | None,
+        style: str | None,
+    ) -> tuple[PptRecord | None, str | None]:
+        """让备用 Subagents 模式也遵守 Session 引用 + PptRecord 模型。"""
+        if intent == "create":
+            record = PptRecord(
+                ppt_id=uuid4().hex,
+                style=style or "business",
+                status="planning",
+            )
+            await self.ppt_record_store.save(record)
+            await self.state_store.add_ppt(session_id, record.ppt_id)
+            return record, None
+
+        target_ppt_id = requested_ppt_id or session_state.active_ppt_id
+        if not target_ppt_id:
+            return None, "当前会话还没有可编辑的 PPT。"
+        if target_ppt_id not in session_state.ppt_ids:
+            return None, "指定的 PPT 不属于当前会话，无法编辑。"
+        record = await self.ppt_record_store.load(target_ppt_id)
+        if record is None:
+            return None, "目标 PPT 记录不存在或无法读取。"
+        await self.state_store.set_active_ppt(session_id, target_ppt_id)
+        return record, None
+
     async def run(
         self,
         user_message: str,
         session_id: str | None = None,
         requested_action: str | None = None,
         style: str | None = None,
+        ppt_id: str | None = None,
     ) -> str:
         """非流式执行一次完整的 Master → Subagents 协作。"""
         session_id = session_id or "default"
@@ -158,13 +199,12 @@ class MasterAgent:
         # ainvoke 内部的 Master/Tool/Subagent 消息状态。
         history = await self.memory.load(session_id)
         session_state = await self.state_store.load(session_id)
-        resolved_style = style or session_state.style
         decision = await self.intent_router.route(
             RouteContext(
                 user_message=user_message,
                 requested_action=requested_action,
-                active_ppt_filename=session_state.active_ppt_filename,
-                style=resolved_style,
+                active_ppt_id=session_state.active_ppt_id,
+                style=style or "business",
                 recent_messages=history,
             )
         )
@@ -174,10 +214,20 @@ class MasterAgent:
             await self.memory.save(session_id, user_message, reply)
             return reply
 
-        await self.state_store.patch(session_id, style=resolved_style)
+        record, context_error = await self._prepare_ppt_record(
+            intent=decision.intent,
+            session_id=session_id,
+            session_state=session_state,
+            requested_ppt_id=ppt_id,
+            style=style,
+        )
+        if context_error or record is None:
+            reply = f"无法编辑 PPT：{context_error}"
+            await self.memory.save(session_id, user_message, reply)
+            return reply
         messages = [
             *history,
-            _build_business_context(session_state, decision.intent),
+            _build_business_context(record, decision.intent),
             HumanMessage(content=user_message),
         ]
 
@@ -196,11 +246,13 @@ class MasterAgent:
         reply = _extract_final_reply(result, input_message_count=len(messages))
         filename = _extract_ppt_filename(result)
         if filename:
-            await self.state_store.patch(
-                session_id,
-                active_ppt_filename=filename,
-                style=resolved_style,
+            record = await self.ppt_record_store.patch(
+                record.ppt_id,
+                filename=filename,
+                status="completed",
             )
+        else:
+            await self.ppt_record_store.patch(record.ppt_id, status="completed")
         await self.memory.save(session_id, user_message, reply)
         logger.info("[Master Agent] 会话 %s 执行完成", session_id)
         return reply
@@ -212,6 +264,7 @@ class MasterAgent:
         on_ppt_created: Callable[[str], Awaitable[None]] | None,
         requested_action: str | None,
         style: str | None,
+        requested_ppt_id: str | None = None,
     ) -> AsyncIterator[dict]:
         """流式执行的公共实现，由两个公开流式入口复用。"""
         session_id = session_id or "default"
@@ -231,13 +284,12 @@ class MasterAgent:
         try:
             history = await self.memory.load(session_id)
             session_state = await self.state_store.load(session_id)
-            resolved_style = style or session_state.style
             decision = await self.intent_router.route(
                 RouteContext(
                     user_message=user_message,
                     requested_action=requested_action,
-                    active_ppt_filename=session_state.active_ppt_filename,
-                    style=resolved_style,
+                    active_ppt_id=session_state.active_ppt_id,
+                    style=style or "business",
                     recent_messages=history,
                 )
             )
@@ -256,18 +308,36 @@ class MasterAgent:
                     response_parts.append(content)
                     yield make_event(TEXT_DELTA, {"content": content})
             else:
-                await self.state_store.patch(session_id, style=resolved_style)
+                record, context_error = await self._prepare_ppt_record(
+                    intent=decision.intent,
+                    session_id=session_id,
+                    session_state=session_state,
+                    requested_ppt_id=requested_ppt_id,
+                    style=style,
+                )
+                if context_error or record is None:
+                    content = f"无法编辑 PPT：{context_error}"
+                    response_parts.append(content)
+                    yield make_event(TEXT_DELTA, {"content": content})
+                    yield make_event(
+                        DONE,
+                        {
+                            "session_id": session_id,
+                            "elapsed_seconds": round(time.monotonic() - started_at, 2),
+                        },
+                    )
+                    return
                 messages = [
                     *history,
-                    _build_business_context(session_state, decision.intent),
+                    _build_business_context(record, decision.intent),
                     HumanMessage(content=user_message),
                 ]
 
                 async def persist_created_ppt(filename: str) -> None:
-                    await self.state_store.patch(
-                        session_id,
-                        active_ppt_filename=filename,
-                        style=resolved_style,
+                    await self.ppt_record_store.patch(
+                        record.ppt_id,
+                        filename=filename,
+                        status="completed",
                     )
                     if on_ppt_created is not None:
                         await on_ppt_created(filename)
@@ -283,6 +353,7 @@ class MasterAgent:
                     if event["event"] == TEXT_DELTA:
                         response_parts.append(event["data"].get("content", ""))
                     yield event
+                await self.ppt_record_store.patch(record.ppt_id, status="completed")
 
         except GraphRecursionError:
             logger.exception(
@@ -297,9 +368,8 @@ class MasterAgent:
             # 流式接口已经开始返回响应，无法再改用普通 HTTP 错误响应，因此将
             # 运行期异常转换为 ERROR 事件；完整堆栈仍写入服务端日志。
             logger.exception(
-                "[Master Agent/流式] 会话 %s 执行异常: %s",
+                "[Master Agent/流式] 会话 %s 执行异常",
                 session_id,
-                exc,
             )
             yield make_event(ERROR, {"message": f"执行异常: {exc}"})
         finally:
@@ -338,6 +408,7 @@ class MasterAgent:
         session_id: str | None = None,
         requested_action: str | None = None,
         style: str | None = None,
+        ppt_id: str | None = None,
     ) -> AsyncIterator[dict]:
         """普通对话的流式入口。"""
         async for event in self._stream(
@@ -346,6 +417,7 @@ class MasterAgent:
             on_ppt_created=None,
             requested_action=requested_action,
             style=style,
+            requested_ppt_id=ppt_id,
         ):
             yield event
 

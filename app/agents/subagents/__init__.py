@@ -97,9 +97,9 @@ Master 的 SYSTEM_PROMPT 和 Tool description 会告诉模型每位专家的能�
 Master LLM 生成 Tool Call，例如：
 
     {
-        "name": "outline_agent_tool",
+        "name": "research_agent_tool",
         "args": {
-            "task": "请为 AI 行业趋势规划一份 6 页、商务风格的 PPT 大纲"
+            "task": "请根据 AI 行业趋势这一用户需求完成联网调研"
         }
     }
 
@@ -175,11 +175,15 @@ Master 再次推理时能够看到这个 ToolMessage，因此可以：
 
     用户请求
         ↓
-    Master 调用 outline_agent_tool(task=主题、页数、风格...)
+    Master 调用 research_agent_tool(task=用户原始需求...)
+        ↓
+    Research Specialist 返回研究报告
+        ↓ ToolMessage 回到 Master
+    Master 调用 outline_agent_tool(task=用户需求 + 研究报告...)
         ↓
     Outline Specialist 返回大纲文本
         ↓ ToolMessage 回到 Master
-    Master 调用 content_agent_tool(task=用户要求 + 完整大纲...)
+    Master 调用 content_agent_tool(task=用户要求 + 研究报告 + 完整大纲...)
         ↓
     Content Specialist 生成 PPT，并返回真实文件名
         ↓ ToolMessage 回到 Master

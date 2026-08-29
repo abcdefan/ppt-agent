@@ -10,12 +10,12 @@ from app.agents.specialists.tool_registry import AGENT_ROLES, AgentRole
 _TOOL_DESCRIPTIONS: dict[AgentRole, str] = {
     "outline": (
         "调用大纲专家规划 PPT 页面结构。"
-        "任务描述应包含主题、受众、页数、风格和补充要求；"
+        "任务描述应包含主题、受众、页数、风格、补充要求和研究报告全文；"
         "返回包含 title、purpose 和 layout_hint 的大纲 JSON。"
     ),
     "research": (
-        "调用联网调研专家为 PPT 大纲补充可靠事实、最新数据、政策、趋势和案例。"
-        "任务描述必须包含用户研究目标和大纲专家返回的完整 JSON；"
+        "调用联网调研专家根据用户原始需求收集可靠事实、最新数据、政策、趋势和案例。"
+        "任务描述必须包含用户原始需求、主题、受众和用途；"
         "返回带 source_title/source_url 的结构化研究报告。"
     ),
     "content": (

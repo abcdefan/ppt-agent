@@ -1,7 +1,7 @@
 """用于锁实验的 Redis PPT 锁 Tools。
 
 这些 Tool 故意不注册给任何 Agent，也不接入默认 Workflow。生产代码若要
-使用分布式锁，应优先在确定性 edit_node 内用上下文管理器封装完整生命周期。
+使用分布式锁，应优先在确定性 ppt_writer_node 内用上下文管理器封装完整生命周期。
 """
 
 import asyncio

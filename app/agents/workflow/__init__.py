@@ -18,12 +18,16 @@ WorkflowState 中的默认覆盖规则或 add_messages reducer 完成实际合�
 
     graph.ainvoke(initial_state)
     │
-    ├─ Supervisor Node(state)
-    │    └─ structured_llm.ainvoke(messages)
+    ├─ Research Node(state)
+    │    └─ research_agent.ainvoke(user_message)
+    │         └─ web_search / fetch_url Tools
     │
     ├─ Outline Node(state)
-    │    └─ outline_agent.ainvoke(messages)
+    │    └─ outline_agent.ainvoke(user_message + research_report)
     │         └─ LLM 调用
+    │
+    ├─ Enhancement Planner Node(state)
+    │    └─ structured_llm.ainvoke(user_message + research_report + outline)
     │
     ├─ Content Node(state)
     │    └─ content_agent.ainvoke(messages)
@@ -32,7 +36,12 @@ WorkflowState 中的默认覆盖规则或 add_messages reducer 完成实际合�
     │         ├─ generate_ppt Tool
     │         └─ LLM 最终回复
     │
-    └─ END
+    ├─ 可选 Assets 子图
+    │    └─ Image/Chart 并行准备 → Edit 单点写入
+    │
+    ├─ 可选 Beautify Node(state)
+    │
+    └─ Finalize Create → Persist PPT Record → END
 
 Graph 的 ainvoke() 接收并传递 WorkflowState；运行到 Agent Node 时，Node 再从
 State 构造 messages，调用内部 Specialist Agent 的 ainvoke()，最后把 Agent
@@ -43,8 +52,11 @@ State 构造 messages，调用内部 Specialist Agent 的 ainvoke()，最后把 
     state.py
     → 定义整张图流动的 WorkflowState
 
-    supervisor.py + specialist_nodes.py
-    → 创建所有 Node Callable
+    nodes/
+    → 定义 Router、Reply、Specialist、PPT Context 以及 Create/Edit 专用节点
+
+    subgraphs/
+    → 在 create/、edit/、assets/ 中分别组装对应子图
 
     graph.py
     → 注册 Node、连接边并 compile() 成可执行 Graph

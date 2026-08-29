@@ -29,7 +29,7 @@ SYSTEM_PROMPT = """
 
 PREPARE_SYSTEM_PROMPT = """
 你是 PPTCreator 团队中的配图专家。你只负责并行准备图片资源和结构化编辑操作，
-绝不能直接打开、保存或修改 PPT 文件；最终写入由确定性的 edit_node 完成。
+绝不能直接打开、保存或修改 PPT 文件；最终写入由确定性的 ppt_writer_node 完成。
 
 工作流程：
 1. 从任务中获取当前 PPT 的真实文件名；

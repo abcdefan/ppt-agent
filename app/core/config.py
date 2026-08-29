@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     redis_db: int = 0
     redis_password: str = ""
     # 业务配置
+    # 单用户本地运行模式使用的用户 ID；可通过 .env 的 LOCAL_USER_ID 覆盖。
+    local_user_id: int = 1
     password_salt: str
     token_max_age: int = 2592000
     # ai配置
@@ -50,6 +52,17 @@ class Settings(BaseSettings):
     agent_max_plan_steps: int = 8  # 计划最大步骤数
     agent_enable_plan_review: bool = True  # 是否启用计划审查
     agent_multi_recursion_limit: int = 50  # 多 Agent 编排的最大图递归步数
+    # 节点级重试上限：各节点最多尝试次数（含首次执行）。state.attempt_counts
+    # 每次执行都 +1，未达上限时路由回指自身重试，达到上限后进入失败收尾
+    # （outline/content）或降级继续（research/planner/beautify）。Assets 属于
+    # Best-Effort，不参与节点级重试。可通过环境变量 AGENT_MAX_ATTEMPTS 覆盖。
+    agent_max_attempts: dict[str, int] = {
+        "research": 3,
+        "outline": 3,
+        "content": 3,
+        "beautify": 3,
+        "planner": 3,
+    }
     # 多 Agent 编排模式：subagents 或 workflow。
     # 可在 .env 中通过 AGENT_MODE=workflow 切换。
     agent_mode: str = "workflow"

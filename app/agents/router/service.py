@@ -18,12 +18,13 @@ logger = logging.getLogger(__name__)
 
 INTENT_ROUTER_PROMPT = """你是 PPTCreator 的入口意图分类器。
 
-只允许选择以下两种意图：
+只允许选择以下三种意图：
 - chat：问候、闲聊、知识问答、解释概念或普通对话，不要求生成 PPT 文件。
 - create：用户要求制作、创建、生成演示文稿、幻灯片或 PPT 文件。
+- edit：用户要求修改、替换、美化、增删已有 PPT 的图片、图表或视觉样式。
 
 结合当前用户消息和少量近期上下文判断。不要因为系统是 PPTCreator 就把普通问题判为 create。
-必须返回 JSON：{"intent": "chat/create", "reason": "一句话理由"}。
+必须返回 JSON：{"intent": "chat/create/edit", "reason": "一句话理由"}。
 """
 
 
@@ -65,12 +66,12 @@ class IntentRouterService:
                 logger.warning("[IntentRouter] Embedding 初始化失败，降级到 LLM: %s", exc)
 
     async def route(self, context: RouteContext) -> RouteDecision:
-        if context.requested_action == "create":
+        if context.requested_action in {"create", "edit"}:
             return RouteDecision(
-                intent="create",
+                intent=context.requested_action,
                 source="explicit",
                 confidence=1.0,
-                reason="用户通过前端明确选择创建 PPT",
+                reason=f"用户通过前端明确选择{context.requested_action} PPT",
             )
 
         await self.initialize()
@@ -81,7 +82,7 @@ class IntentRouterService:
                 )
                 margin = top_score - second_score
                 if (
-                    top_intent in {"chat", "create"}
+                    top_intent in {"chat", "create", "edit"}
                     and top_score >= settings.intent_embedding_min_score
                     and margin >= settings.intent_embedding_margin
                 ):
@@ -105,7 +106,7 @@ class IntentRouterService:
 
         briefing = (
             f"当前用户消息：{context.user_message}\n"
-            f"当前活动 PPT：{context.active_ppt_filename or '无'}\n"
+            f"当前活动 PPT ID：{context.active_ppt_id or '无'}\n"
             f"当前风格：{context.style}\n"
             "请输出意图分类 JSON。"
         )

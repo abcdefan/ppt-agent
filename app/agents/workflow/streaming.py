@@ -11,11 +11,23 @@ import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
-from app.agents.specialists.tool_registry import AGENT_ROLES
-from app.agents.workflow.reply_node import CREATE_REPLY_MARKER, REPLY
+from app.agents.workflow.nodes.ppt_writer import PPT_WRITER_NODE
+from app.agents.workflow.nodes.create.planner import ENHANCEMENT_PLANNER_NODE
+from app.agents.workflow.nodes.edit.supervisor import EDIT_SUPERVISOR_NODE
+from app.agents.workflow.nodes.reply import (
+    CREATE_REPLY_MARKER,
+    REPLY_NODE,
+)
+from app.agents.workflow.nodes.router import INTENT_ROUTER_NODE
+from app.agents.workflow.nodes.specialist import (
+    BEAUTIFY_NODE,
+    CHART_NODE,
+    CONTENT_NODE,
+    IMAGE_NODE,
+    OUTLINE_NODE,
+    RESEARCH_NODE,
+)
 from app.agents.workflow.state import WorkflowState
-from app.agents.workflow.edit_node import EDIT_NODE
-from app.agents.workflow.router_node import INTENT_ROUTER
 from app.schemas.events import (
     AGENT_RESULT,
     AGENT_SWITCH,
@@ -30,13 +42,30 @@ logger = logging.getLogger(__name__)
 
 TOOL_RESULT_PREVIEW_LEN = 500
 TOP_LEVEL_NODES = {
-    INTENT_ROUTER,
-    REPLY,
-    *AGENT_ROLES,
-    EDIT_NODE,
+    INTENT_ROUTER_NODE,
+    REPLY_NODE,
+    RESEARCH_NODE,
+    OUTLINE_NODE,
+    CONTENT_NODE,
+    IMAGE_NODE,
+    CHART_NODE,
+    PPT_WRITER_NODE,
+    BEAUTIFY_NODE,
+    EDIT_SUPERVISOR_NODE,
+    ENHANCEMENT_PLANNER_NODE,
 }
 
-OBSERVABLE_WORKFLOW_ROLES = {*AGENT_ROLES, EDIT_NODE}
+NODE_TO_AGENT_ROLE = {
+    RESEARCH_NODE: "research",
+    OUTLINE_NODE: "outline",
+    CONTENT_NODE: "content",
+    IMAGE_NODE: "image",
+    CHART_NODE: "chart",
+    PPT_WRITER_NODE: "writer",
+    BEAUTIFY_NODE: "beautify",
+}
+
+OBSERVABLE_WORKFLOW_NODES = set(NODE_TO_AGENT_ROLE)
 
 AGENT_COMPLETION_MESSAGES = {
     "outline": "大纲专家已完成 PPT 页面结构规划",
@@ -45,7 +74,7 @@ AGENT_COMPLETION_MESSAGES = {
     "image": "配图专家已完成本轮配图处理",
     "chart": "图表专家已完成本轮图表处理",
     "beautify": "美化专家已完成本轮视觉优化",
-    EDIT_NODE: "资源写入节点已统一提交图片和图表操作",
+    "writer": "PPT Writer 已统一提交图片和图表操作",
 }
 
 
@@ -100,7 +129,6 @@ async def stream_workflow_events(
     initial_state: WorkflowState,
     recursion_limit: int,
     on_ppt_created: Callable[[str], Awaitable[None]] | None = None,
-    on_state_updated: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> AsyncIterator[dict]:
     """将 Workflow 的 v2 事件流转换成前端业务事件。
 
@@ -123,16 +151,19 @@ async def stream_workflow_events(
         event_data = raw_event.get("data") or {}
         call_id = str(raw_event.get("run_id") or "")
 
-        # 顶层 Node 开始时，记录当前正在运行谁。Supervisor 只是
-        # 内部路由节点；前端只需展示 Specialist 的角色切换。
+        # 顶层 Node 开始时，记录当前正在运行谁。Supervisor 和
+        # Enhancement Planner 都是内部规划节点，不向前端展示结构化 JSON。
         if event_kind == "on_chain_start" and event_name in TOP_LEVEL_NODES:
             if event_name != current_node:
                 current_node = event_name
-                if event_name in OBSERVABLE_WORKFLOW_ROLES:
-                    yield make_event(AGENT_SWITCH, {"agent": event_name})
+                if event_name in OBSERVABLE_WORKFLOW_NODES:
+                    yield make_event(
+                        AGENT_SWITCH,
+                        {"agent": NODE_TO_AGENT_ROLE[event_name]},
+                    )
             continue
 
-        # 只放行 Reply Node 的模型文字；Router/Supervisor 的结构化 JSON
+        # 只放行 Reply Node 的模型文字；Router/Supervisor/Planner 的结构化 JSON
         # 和 Specialist 的内部协作内容都不发给前端。
         # - Supervisor 输出的是 {"next": ...} 路由 JSON；
         # - Specialist 输出的是大纲 JSON、工具调用前说明和最终回复。
@@ -140,14 +171,14 @@ async def stream_workflow_events(
         # TEXT_DELTA。Create 的确定性完成文案不调用 LLM，会在下面的
         # Reply Node on_chain_end 分支发送。
         if event_kind == "on_chat_model_stream":
-            if current_node == REPLY:
+            if current_node == REPLY_NODE:
                 chunk = event_data.get("chunk")
                 content = getattr(chunk, "content", "") if chunk else ""
                 if isinstance(content, str) and content:
                     yield make_event(TEXT_DELTA, {"content": content})
             continue
 
-        if event_kind == "on_chain_end" and event_name == INTENT_ROUTER:
+        if event_kind == "on_chain_end" and event_name == INTENT_ROUTER_NODE:
             output = event_data.get("output")
             if isinstance(output, dict):
                 yield make_event(
@@ -163,7 +194,7 @@ async def stream_workflow_events(
 
         # Chat 已通过 on_chat_model_stream 逐 Token 发送；Create 不调用 LLM，
         # 因此只在统一 Reply Node 结束时发送带标记的确定性完成文案。
-        if event_kind == "on_chain_end" and event_name == REPLY:
+        if event_kind == "on_chain_end" and event_name == REPLY_NODE:
             output = event_data.get("output")
             messages = output.get("messages", []) if isinstance(output, dict) else []
             for message in reversed(messages):
@@ -183,22 +214,15 @@ async def stream_workflow_events(
         # 顶层 Specialist Node 正常结束时，只推送一条由代码
         # 组装的结果摘要。这不会暴露原始大纲 JSON、Prompt 或
         # “我将调用……”等模型过程文字。
-        if event_kind == "on_chain_end" and event_name in OBSERVABLE_WORKFLOW_ROLES:
+        if event_kind == "on_chain_end" and event_name in OBSERVABLE_WORKFLOW_NODES:
             output = event_data.get("output")
-            if on_state_updated is not None and isinstance(output, dict):
-                state_patch: dict[str, Any] = {}
-                if isinstance(output.get("outline"), str):
-                    state_patch["outline"] = output["outline"]
-                if isinstance(output.get("filename"), str):
-                    state_patch["active_ppt_filename"] = output["filename"]
-                if state_patch:
-                    await on_state_updated(state_patch)
+            agent_role = NODE_TO_AGENT_ROLE[event_name]
             yield make_event(
                 AGENT_RESULT,
                 {
-                    "agent": event_name,
+                    "agent": agent_role,
                     "message": _agent_result_message(
-                        event_name,
+                        agent_role,
                         output,
                     ),
                 },

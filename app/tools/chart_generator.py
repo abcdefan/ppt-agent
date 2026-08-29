@@ -328,6 +328,42 @@ def _add_chart_slide_to_ppt(
     )
 
 
+def _validate_chart_config(config: object) -> dict:
+    """校验模型生成的图表配置，避免错误结构进入 matplotlib。"""
+    if not isinstance(config, dict):
+        raise ValueError(
+            "chart_config 顶层必须是 JSON 对象，不能是数组；多张图表请分别调用工具"
+        )
+
+    chart_type = config.get("chart_type", "bar")
+    if chart_type not in {"bar", "pie", "line", "area"}:
+        raise ValueError(
+            f"不支持的图表类型 {chart_type!r}，可选: bar/pie/line/area"
+        )
+
+    data = config.get("data")
+    if not isinstance(data, dict):
+        raise ValueError(
+            "chart_config.data 必须是包含 labels 和 values 的 JSON 对象，不能是数组"
+        )
+
+    labels = data.get("labels")
+    values = data.get("values")
+    if not isinstance(labels, list) or not labels:
+        raise ValueError("chart_config.data.labels 必须是非空数组")
+    if not isinstance(values, list) or not values:
+        raise ValueError("chart_config.data.values 必须是非空数组")
+    if len(labels) != len(values):
+        raise ValueError("chart_config.data.labels 与 values 的数量必须一致")
+    if not all(
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+        for value in values
+    ):
+        raise ValueError("chart_config.data.values 只能包含数字")
+
+    return config
+
+
 def _prepare_chart_asset(config: dict) -> tuple[Path, str, str, str]:
     """渲染图表图片，但不打开或修改任何 PPT 文件。"""
     chart_type = config.get("chart_type", "bar")
@@ -362,14 +398,15 @@ def _prepare_chart_asset(config: dict) -> tuple[Path, str, str, str]:
 async def prepare_chart_operation(filename: str, chart_config: str) -> str:
     """准备一项 PPT 图表操作，但不直接修改 PPT 文件。
 
-    返回的 operation 会由 Workflow 的确定性 edit_node 汇总并统一写入。
+    返回的 operation 会由 Workflow 的确定性 ppt_writer_node 汇总并统一写入。
 
     Args:
         filename: 目标 PPT 文件名，仅用于标识操作目标
-        chart_config: JSON 字符串格式的图表配置
+        chart_config: 单个 JSON 对象的字符串，data 必须是包含 labels 和 values
+            的对象。多张图表需要分别调用本工具，不能传入 JSON 数组。
     """
     try:
-        config = json.loads(chart_config)
+        config = _validate_chart_config(json.loads(chart_config))
         output_dir = settings.workspace_path / "ppt_output"
         if not (output_dir / filename).exists():
             return json.dumps(
@@ -399,6 +436,11 @@ async def prepare_chart_operation(filename: str, chart_config: str) -> str:
     except json.JSONDecodeError as exc:
         return json.dumps(
             {"success": False, "message": f"chart_config JSON 解析失败: {exc}"},
+            ensure_ascii=False,
+        )
+    except ValueError as exc:
+        return json.dumps(
+            {"success": False, "message": f"chart_config 格式错误: {exc}"},
             ensure_ascii=False,
         )
     except Exception as exc:
@@ -440,7 +482,7 @@ async def add_chart_slide(
         chart_config: JSON字符串，描述图表配置
     """
     try:
-        config = json.loads(chart_config)
+        config = _validate_chart_config(json.loads(chart_config))
         chart_type = config.get("chart_type", "bar")
         style = config.get("style", "business")
         theme = STYLE_THEMES.get(style, DEFAULT_THEME)
@@ -469,6 +511,8 @@ async def add_chart_slide(
 
     except json.JSONDecodeError as e:
         return f"错误：chart_config JSON 解析失败: {e}"
+    except ValueError as e:
+        return f"错误：chart_config 格式错误: {e}"
     except Exception as e:
         logger.error("图表生成失败: %s", e)
         return f"错误：图表生成失败: {e}"

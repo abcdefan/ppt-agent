@@ -11,21 +11,19 @@ logger = logging.getLogger(__name__)
 
 _STATE_PREFIX = "agent:session_state:"
 _PERSISTENT_FIELDS = {
-    "active_ppt_filename",
-    "outline",
-    "style",
+    "active_ppt_id",
+    "ppt_ids",
 }
 
 
 class SessionState(BaseModel):
-    """当前会话正在操作的 PPT 业务上下文。"""
+    """当前会话与 PPT 的轻量关联，不保存 PPT 自身业务内容。"""
 
     model_config = ConfigDict(extra="ignore")
 
-    schema_version: int = Field(default=1, ge=1)
-    active_ppt_filename: str | None = None
-    outline: str | None = None
-    style: str = "business"
+    schema_version: int = Field(default=2, ge=1)
+    active_ppt_id: str | None = None
+    ppt_ids: list[str] = Field(default_factory=list)
 
 
 class SessionStateStore:
@@ -79,6 +77,29 @@ class SessionStateStore:
         updated = SessionState.model_validate(updated.model_dump())
         await self.save(session_id, updated)
         return updated
+
+    async def add_ppt(
+        self,
+        session_id: str,
+        ppt_id: str,
+        *,
+        make_active: bool = True,
+    ) -> SessionState:
+        """把 PPT 关联到会话；重复添加时保持列表去重和原有顺序。"""
+        state = await self.load(session_id)
+        ppt_ids = list(dict.fromkeys([*state.ppt_ids, ppt_id]))
+        return await self.patch(
+            session_id,
+            ppt_ids=ppt_ids,
+            active_ppt_id=ppt_id if make_active else state.active_ppt_id,
+        )
+
+    async def set_active_ppt(self, session_id: str, ppt_id: str) -> SessionState:
+        """只允许激活已经属于当前会话的 PPT。"""
+        state = await self.load(session_id)
+        if ppt_id not in state.ppt_ids:
+            raise ValueError(f"PPT {ppt_id} 不属于会话 {session_id}")
+        return await self.patch(session_id, active_ppt_id=ppt_id)
 
     async def clear(self, session_id: str) -> None:
         client = self.redis

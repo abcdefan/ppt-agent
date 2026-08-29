@@ -36,7 +36,7 @@ TEXT_DELTA = "TEXT_DELTA"
 # 错误 {message}
 ERROR = "ERROR"
 
-# 流结束 {session_id, elapsed_seconds}
+# 流结束 {session_id, run_id, elapsed_seconds}；普通 chat 的 run_id 为 null
 DONE = "DONE"
 
 
