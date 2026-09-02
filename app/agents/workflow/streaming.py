@@ -12,12 +12,10 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from app.agents.workflow.nodes.ppt_writer import PPT_WRITER_NODE
+from app.agents.workflow.nodes.ppt_context.resolve import MATCH_ACTIVE_PPT_NODE
 from app.agents.workflow.nodes.create.planner import ENHANCEMENT_PLANNER_NODE
 from app.agents.workflow.nodes.edit.supervisor import EDIT_SUPERVISOR_NODE
-from app.agents.workflow.nodes.reply import (
-    CREATE_REPLY_MARKER,
-    REPLY_NODE,
-)
+from app.agents.workflow.nodes.reply import REPLY_NODE
 from app.agents.workflow.nodes.router import INTENT_ROUTER_NODE
 from app.agents.workflow.nodes.specialist import (
     BEAUTIFY_NODE,
@@ -31,6 +29,7 @@ from app.agents.workflow.state import WorkflowState
 from app.schemas.events import (
     AGENT_RESULT,
     AGENT_SWITCH,
+    INPUT_REQUIRED,
     INTENT_ROUTED,
     TEXT_DELTA,
     TOOL_CALL,
@@ -43,6 +42,7 @@ logger = logging.getLogger(__name__)
 TOOL_RESULT_PREVIEW_LEN = 500
 TOP_LEVEL_NODES = {
     INTENT_ROUTER_NODE,
+    MATCH_ACTIVE_PPT_NODE,
     REPLY_NODE,
     RESEARCH_NODE,
     OUTLINE_NODE,
@@ -128,6 +128,7 @@ async def stream_workflow_events(
     graph,
     initial_state: WorkflowState,
     recursion_limit: int,
+    thread_id: str | None = None,
     on_ppt_created: Callable[[str], Awaitable[None]] | None = None,
 ) -> AsyncIterator[dict]:
     """将 Workflow 的 v2 事件流转换成前端业务事件。
@@ -139,17 +140,43 @@ async def stream_workflow_events(
     和 Tool 事件。
     """
     current_node: str | None = None
+    emitted_interrupt_ids: set[str] = set()
     config = {"recursion_limit": recursion_limit}
+    if thread_id is not None:
+        config["configurable"] = {"thread_id": thread_id}
 
     async for raw_event in graph.astream_events(
         initial_state,
         version="v2",
         config=config,
+        # exit 模式只在本次 Graph 结束（包括 interrupt 退出）时
+        # 落 checkpoint，符合本项目不做中途故障恢复的取舍。
+        durability="exit",
     ):
         event_kind = raw_event.get("event", "")
         event_name = raw_event.get("name", "")
         event_data = raw_event.get("data") or {}
         call_id = str(raw_event.get("run_id") or "")
+
+        # LangGraph 的动态 interrupt 不会作为普通异常抛出，而是在顶层
+        # on_chain_stream chunk 中携带 __interrupt__。转换成稳定的业务事件，
+        # 让前端能直接展示候选 PPT。
+        if event_kind == "on_chain_stream":
+            chunk = event_data.get("chunk")
+            interrupts = (
+                chunk.get("__interrupt__") if isinstance(chunk, dict) else None
+            )
+            if interrupts:
+                for interrupt_item in interrupts:
+                    interrupt_id = str(getattr(interrupt_item, "id", ""))
+                    if interrupt_id and interrupt_id in emitted_interrupt_ids:
+                        continue
+                    if interrupt_id:
+                        emitted_interrupt_ids.add(interrupt_id)
+                    value = getattr(interrupt_item, "value", None)
+                    if isinstance(value, dict):
+                        yield make_event(INPUT_REQUIRED, value)
+                continue
 
         # 顶层 Node 开始时，记录当前正在运行谁。Supervisor 和
         # Enhancement Planner 都是内部规划节点，不向前端展示结构化 JSON。
@@ -185,6 +212,7 @@ async def stream_workflow_events(
                     INTENT_ROUTED,
                     {
                         "intent": output.get("intent", "chat"),
+                        "execute": output.get("execute", False),
                         "source": output.get("route_source", "fallback"),
                         "confidence": output.get("route_confidence"),
                         "reason": output.get("route_reason", ""),
@@ -192,23 +220,19 @@ async def stream_workflow_events(
                 )
             continue
 
-        # Chat 已通过 on_chat_model_stream 逐 Token 发送；Create 不调用 LLM，
-        # 因此只在统一 Reply Node 结束时发送带标记的确定性完成文案。
+        # Chat 已通过 on_chat_model_stream 逐 Token 发送；Create/Edit 不调用 LLM，
+        # 因此只在统一 Reply Node 结束时发送 complete 模式的确定性完成文案。
         if event_kind == "on_chain_end" and event_name == REPLY_NODE:
             output = event_data.get("output")
-            messages = output.get("messages", []) if isinstance(output, dict) else []
-            for message in reversed(messages):
-                content = getattr(message, "content", "")
-                reply_kind = getattr(message, "additional_kwargs", {}).get(
-                    "workflow_reply_kind"
-                )
+            if isinstance(output, dict):
+                content = output.get("final_response")
+                response_mode = output.get("final_response_mode")
                 if (
-                    reply_kind == CREATE_REPLY_MARKER
+                    response_mode == "complete"
                     and isinstance(content, str)
                     and content
                 ):
                     yield make_event(TEXT_DELTA, {"content": content})
-                    break
             continue
 
         # 顶层 Specialist Node 正常结束时，只推送一条由代码

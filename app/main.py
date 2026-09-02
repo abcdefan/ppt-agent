@@ -1,7 +1,7 @@
 """主应用入口"""
 
 import logging
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,29 +39,48 @@ async def lifespan(app: FastAPI):
             f"{settings.redis_host}:{settings.redis_port}/{settings.redis_db}"
         )
 
-        # 在基础设施就绪后，根据配置只创建一种多 Agent 编排入口。
-        # FastAPI 只有执行到 yield 后才开始接收请求，因此所有
-        # Controller 都可以复用同一个进程级 agent_runner。
-        if settings.agent_mode == "subagents":
-            from app.agents.subagents.master import MasterAgent
+        # ExitStack 让 Workflow 的 Redis Saver 活得和当前 worker 一样久。
+        # Saver 内部使用独立连接池，退出这个上下文时才关闭，
+        # 不会在每次保存 checkpoint 后断开。
+        async with AsyncExitStack() as stack:
+            # 在基础设施就绪后，根据配置只创建一种多 Agent 编排入口。
+            # FastAPI 只有执行到 yield 后才开始接收请求，因此所有
+            # Controller 都可以复用同一个进程级 agent_runner。
+            if settings.agent_mode == "subagents":
+                from app.agents.subagents.master import MasterAgent
 
-            agent_runner = MasterAgent()
-        elif settings.agent_mode == "workflow":
-            from app.agents.workflow.runner import WorkflowRunner
+                agent_runner = MasterAgent()
+            elif settings.agent_mode == "workflow":
+                from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 
-            agent_runner = WorkflowRunner()
-        else:
-            raise ValueError(f"不支持的 Agent 模式: {settings.agent_mode}")
+                from app.agents.workflow.runner import WorkflowRunner
 
-        # Controller 只依赖统一的 run_stream 接口，不需要知道底层是
-        # MasterAgent 还是 WorkflowRunner。
-        app.state.agent_runner = agent_runner
-        initialize = getattr(agent_runner, "initialize", None)
-        if initialize is not None:
-            await initialize()
-        print(f"Agent 编排模式已启动: {settings.agent_mode}")
+                checkpointer = await stack.enter_async_context(
+                    AsyncRedisSaver.from_conn_string(
+                        settings.redis_url,
+                        ttl={
+                            "default_ttl": settings.agent_checkpoint_ttl_minutes,
+                            "refresh_on_read": (
+                                settings.agent_checkpoint_refresh_on_read
+                            ),
+                        },
+                    )
+                )
+                # from_conn_string() 的 __aenter__ 已经执行 asetup()，
+                # 这里不要再重复初始化 Redis 索引。
+                agent_runner = WorkflowRunner(checkpointer=checkpointer)
+            else:
+                raise ValueError(f"不支持的 Agent 模式: {settings.agent_mode}")
 
-        yield  # FastAPI 在这里持续处理请求
+            # Controller 只依赖统一的 run_stream 接口，不需要知道底层是
+            # MasterAgent 还是 WorkflowRunner。
+            app.state.agent_runner = agent_runner
+            initialize = getattr(agent_runner, "initialize", None)
+            if initialize is not None:
+                await initialize()
+            print(f"Agent 编排模式已启动: {settings.agent_mode}")
+
+            yield  # FastAPI 在这里持续处理请求
     finally:
         # 关闭时执行
         await redis_client.aclose()

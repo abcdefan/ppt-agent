@@ -57,15 +57,19 @@ class PptRecordRepository:
         *,
         user_id: int,
         lifecycle_status: str | None = None,
-        limit: int = 50,
+        source_type: str | None = None,
+        limit: int | None = 50,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
         query = select(self.table).where(self.table.c.owner_user_id == user_id)
         if lifecycle_status is not None:
             query = query.where(self.table.c.lifecycle_status == lifecycle_status)
-        rows = await self.db.fetch_all(
-            query.order_by(self.table.c.updated_at.desc()).limit(limit).offset(offset)
-        )
+        if source_type is not None:
+            query = query.where(self.table.c.source_type == source_type)
+        query = query.order_by(self.table.c.updated_at.desc())
+        if limit is not None:
+            query = query.limit(limit).offset(offset)
+        rows = await self.db.fetch_all(query)
         return [row_to_dict(row) or {} for row in rows]
 
     async def update_artifacts(

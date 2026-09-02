@@ -209,7 +209,7 @@ class MasterAgent:
             )
         )
 
-        if decision.intent == "chat":
+        if decision.intent == "chat" or not decision.execute:
             reply = await self.chat_responder.invoke(user_message, history)
             await self.memory.save(session_id, user_message, reply)
             return reply
@@ -297,13 +297,14 @@ class MasterAgent:
                 INTENT_ROUTED,
                 {
                     "intent": decision.intent,
+                    "execute": decision.execute,
                     "source": decision.source,
                     "confidence": decision.confidence,
                     "reason": decision.reason,
                 },
             )
 
-            if decision.intent == "chat":
+            if decision.intent == "chat" or not decision.execute:
                 async for content in self.chat_responder.stream(user_message, history):
                     response_parts.append(content)
                     yield make_event(TEXT_DELTA, {"content": content})

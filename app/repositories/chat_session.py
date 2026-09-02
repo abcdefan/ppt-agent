@@ -86,7 +86,19 @@ class ChatSessionRepository:
             )
             .values(active_ppt_id=ppt_id)
         )
-        return bool(affected)
+        if affected:
+            return True
+
+        # MySQL 默认按“实际发生变化的行数”返回 UPDATE rowcount。目标 PPT
+        # 已经是当前 Active PPT 时 rowcount 会是 0，但这仍然是一次成功的
+        # 幂等设置。回读权威记录，区分“目标状态已经满足”和“Session 不存在、
+        # 不属于该用户或已经归档”。
+        session = await self.get(session_id=session_id, user_id=user_id)
+        return bool(
+            session
+            and session.get("lifecycle_status") == "ACTIVE"
+            and session.get("active_ppt_id") == ppt_id
+        )
 
     async def archive(self, *, session_id: str, user_id: int) -> bool:
         affected = await self.db.execute(

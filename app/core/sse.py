@@ -15,5 +15,7 @@ def sse_event(event_type: str, data: dict) -> str:
 
     输出：`data: {"type": <event_type>, ...}\n\n`
     """
-    payload = {"type": event_type, **data}
+    # 业务 data 可能包含自己的类型字段（例如 HITL input_type）。
+    # SSE 顶层 type 始终以事件名为准，避免 data 覆盖后前端无法分发。
+    payload = {**data, "type": event_type}
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"

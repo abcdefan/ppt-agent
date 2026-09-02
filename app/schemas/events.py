@@ -3,8 +3,11 @@
 # 状态提示（"正在分析需求..."）
 AGENT_THINKING = "AGENT_THINKING"
 
-# 入口意图分类完成 {intent, source, confidence, reason}
+# 入口意图分类完成 {intent, execute, source, confidence, reason}
 INTENT_ROUTED = "INTENT_ROUTED"
+
+# Workflow 暂停并等待用户输入；data 为 interrupt() 的结构化 payload。
+INPUT_REQUIRED = "INPUT_REQUIRED"
 
 # 多 Agent 编排切换到某个专家 {agent}
 AGENT_SWITCH = "AGENT_SWITCH"

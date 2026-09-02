@@ -22,6 +22,7 @@ class RouteContext:
 
 class RouteDecision(BaseModel):
     intent: Intent
+    execute: bool = Field(description="本轮是否立即执行 Create/Edit 文件操作")
     source: RouteSource
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     reason: str
@@ -29,4 +30,5 @@ class RouteDecision(BaseModel):
 
 class LLMIntentDecision(BaseModel):
     intent: Intent = Field(description="用户意图，只能是 chat、create 或 edit")
-    reason: str = Field(description="一句话分类理由")
+    execute: bool = Field(description="用户是否明确要求本轮立即执行该意图")
+    reason: str = Field(description="一句话说明意图和执行判断理由")

@@ -2,7 +2,9 @@
 
 这个文件只负责“把已经定义好的 Node 串成图”：
 
-    START -> Intent Router -> {Chat | Create Init | Edit Target} -> 对应 PPT 子图 -> Reply
+    START -> Intent Router -> {
+        Chat | Create Init | Active PPT Match -> Edit Target
+    } -> 对应 PPT 子图 -> Reply
 
 父图只负责意图分流和统一回复；PPT 专家与具体执行顺序全部封装在子图中。
 """
@@ -10,6 +12,7 @@
 import logging
 
 from langchain_core.language_models import BaseChatModel
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 
 from app.agents.workflow.nodes.ppt_context.initialize import (
@@ -17,7 +20,9 @@ from app.agents.workflow.nodes.ppt_context.initialize import (
     build_initialize_node,
 )
 from app.agents.workflow.nodes.ppt_context.resolve import (
+    MATCH_ACTIVE_PPT_NODE,
     RESOLVE_TARGET_PPT_NODE,
+    build_active_ppt_match_node,
     build_resolve_node,
     route_after_resolution,
 )
@@ -49,8 +54,10 @@ TARGET_ERROR = "error"
 
 
 def route_after_intent(state: WorkflowState) -> str:
-    """普通对话直接回复；Create/Edit 先准备各自的 PPT 上下文。"""
+    """未获执行授权时统一对话；仅执行态准备 Create/Edit 上下文。"""
     intent = state.get("intent")
+    if not state.get("execute", False):
+        return REPLY_NODE
     if intent == "create":
         return CREATE_ROUTE
     if intent == "edit":
@@ -66,6 +73,9 @@ def build_workflow_graph(
     ppt_record_store: PptRecordStore | None = None,
     ppt_context_service: PptContextService | None = None,
     creation_subgraph=None,
+    target_match_llm: BaseChatModel | None = None,
+    *,
+    checkpointer: BaseCheckpointSaver,
 ):
     """创建只负责 Intent 分流、PPT 子图挂载与统一回复的父图。"""
     # 1. 定义整张图共享的 State 结构。
@@ -81,6 +91,13 @@ def build_workflow_graph(
         build_initialize_node(
             session_store,
             ppt_record_store,
+            ppt_context_service,
+        ),
+    )
+    graph_builder.add_node(
+        MATCH_ACTIVE_PPT_NODE,
+        build_active_ppt_match_node(
+            target_match_llm or llm,
             ppt_context_service,
         ),
     )
@@ -124,11 +141,14 @@ def build_workflow_graph(
         {
             REPLY_NODE: REPLY_NODE,
             CREATE_ROUTE: INITIALIZE_PPT_NODE,
-            EDIT_ROUTE: RESOLVE_TARGET_PPT_NODE,
+            EDIT_ROUTE: MATCH_ACTIVE_PPT_NODE,
         },
     )
 
     graph_builder.add_edge(INITIALIZE_PPT_NODE, creation_subgraph_name)
+    # 先把 LLM 的 Active PPT 核验结果写入 State，再进入可能 interrupt 的
+    # Resolve 节点。恢复时只重跑 Resolve，不会再次调用目标核验 LLM。
+    graph_builder.add_edge(MATCH_ACTIVE_PPT_NODE, RESOLVE_TARGET_PPT_NODE)
     graph_builder.add_conditional_edges(
         RESOLVE_TARGET_PPT_NODE,
         route_after_resolution,
@@ -143,8 +163,9 @@ def build_workflow_graph(
     graph_builder.add_edge(creation_subgraph_name, REPLY_NODE)
     graph_builder.add_edge(PPT_EDIT_SUBGRAPH, REPLY_NODE)
 
-    # compile() 之后得到真正可以 ainvoke()/astream_events() 的图。
-    graph = graph_builder.compile()
+    # Checkpointer 只绑定在父图。挂载为 Node 的子图会沿用父图的
+    # checkpoint 上下文，无需再为每个子图创建 Redis Saver。
+    graph = graph_builder.compile(checkpointer=checkpointer)
     logger.info(
         "Workflow 父图构建完成: %s -> %s -> {%s | %s | %s} -> %s",
         START,

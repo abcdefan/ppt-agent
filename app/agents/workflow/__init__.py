@@ -12,22 +12,22 @@ Node、Graph 与 State 更新分为三个阶段：
     → 真正将 Node 返回的 patch 合并进 State，再传给下一个 Node
 
 因此，Node 只负责读取当前 State 并返回局部更新；LangGraph 负责根据
-WorkflowState 中的默认覆盖规则或 add_messages reducer 完成实际合并。
+WorkflowState 中的默认覆盖规则或业务字段 reducer 完成实际合并。
 
 外层 Graph 与内部 Agent / LLM 的调用层级如下：
 
     graph.ainvoke(initial_state)
     │
     ├─ Research Node(state)
-    │    └─ research_agent.ainvoke(user_message)
+    │    └─ research_agent.ainvoke(conversation_history + user_message)
     │         └─ web_search / fetch_url Tools
     │
     ├─ Outline Node(state)
-    │    └─ outline_agent.ainvoke(user_message + research_report)
+    │    └─ outline_agent.ainvoke(conversation_history + user_message + research_report)
     │         └─ LLM 调用
     │
     ├─ Enhancement Planner Node(state)
-    │    └─ structured_llm.ainvoke(user_message + research_report + outline)
+    │    └─ structured_llm.ainvoke(history + user_message + report + outline)
     │
     ├─ Content Node(state)
     │    └─ content_agent.ainvoke(messages)

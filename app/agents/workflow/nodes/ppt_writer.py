@@ -7,7 +7,6 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import HumanMessage
 from pptx import Presentation
 
 from app.agents.workflow.state import WorkflowState
@@ -125,18 +124,33 @@ async def ppt_writer_node(state: WorkflowState) -> dict[str, Any]:
         state.get("asset_operations", []),
         key=_operation_sort_key,
     )
+    if state.get("intent") == "edit":
+        requested_types = set(state.get("asset_tasks", []))
+        prepared_types = {
+            str(operation.get("type"))
+            for operation in operations
+            if operation.get("type") in {"image", "chart"}
+        }
+        missing_types = requested_types - prepared_types
+        if missing_types:
+            missing_text = "、".join(sorted(missing_types))
+            return {
+                "asset_apply_status": "failed",
+                "applied_operation_ids": [],
+                "workflow_error": f"Assets 未准备出所需资源：{missing_text}",
+            }
     if not operations:
+        if state.get("intent") == "edit":
+            return {
+                "asset_apply_status": "failed",
+                "applied_operation_ids": [],
+                "workflow_error": "Assets 未产生任何可执行的图片或图表操作",
+            }
         return {
             "asset_apply_status": "skipped",
             "applied_operation_ids": [],
             "completed_agents": ["writer"],
             "completed_stages": ["assets"],
-            "messages": [
-                HumanMessage(
-                    content="ppt_writer_node 未收到可执行的图片或图表操作，已跳过写入",
-                    name=PPT_WRITER_NODE,
-                )
-            ],
         }
 
     # 当前生产子图中 ppt_writer_node 是唯一 Writer，因此暂不加锁。未来若允许
@@ -161,6 +175,13 @@ async def ppt_writer_node(state: WorkflowState) -> dict[str, Any]:
             logger.exception("基础 PPT 已不可用，无法执行降级交付: %s", filename)
             raise writer_exc from base_ppt_exc
 
+        if state.get("intent") == "edit":
+            return {
+                "asset_apply_status": "failed",
+                "applied_operation_ids": [],
+                "workflow_error": f"资源写入失败：{writer_exc}",
+            }
+
         return {
             "asset_apply_status": "failed",
             "applied_operation_ids": [],
@@ -176,12 +197,6 @@ async def ppt_writer_node(state: WorkflowState) -> dict[str, Any]:
             ],
             "attempt_error": None,
             "route_reason": "资源写入失败，已降级交付基础版本",
-            "messages": [
-                HumanMessage(
-                    content="ppt_writer_node 写入增强资源失败，基础 PPT 完好，已降级交付",
-                    name=PPT_WRITER_NODE,
-                )
-            ],
         }
 
     operation_ids = [
@@ -205,26 +220,19 @@ async def ppt_writer_node(state: WorkflowState) -> dict[str, Any]:
         ],
         "completed_agents": ["writer"],
         "completed_stages": ["assets"],
-        "messages": [
-            HumanMessage(
-                content=f"ppt_writer_node 已统一应用 {len(operations)} 项 PPT 写入操作",
-                name=PPT_WRITER_NODE,
-            )
-        ],
     }
 
 
-async def skip_assets_node(_state: WorkflowState) -> dict:
+async def skip_assets_node(state: WorkflowState) -> dict:
     """防御性跳过空的 Assets 计划。"""
+    if state.get("intent") == "edit":
+        return {
+            "asset_apply_status": "failed",
+            "workflow_error": "Edit Supervisor 选择了 Assets，但没有指定资源任务",
+        }
     return {
         "asset_apply_status": "skipped",
         "completed_stages": ["assets"],
-        "messages": [
-            HumanMessage(
-                content="本轮没有图片或图表任务，已跳过 Assets",
-                name=ASSETS_SKIP_NODE,
-            )
-        ],
     }
 
 

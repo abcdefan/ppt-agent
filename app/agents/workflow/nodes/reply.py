@@ -1,12 +1,9 @@
 """Chat/Create/Edit 三条 Workflow 分支共用的用户回复节点。"""
 
-from langchain_core.messages import AIMessage
-
 from app.agents.router import ChatResponder
 from app.agents.workflow.state import WorkflowState
 
 REPLY_NODE = "reply_node"
-CREATE_REPLY_MARKER = "workflow_create_completion"
 
 _AGENT_LABELS = {
     "outline": "大纲规划",
@@ -21,19 +18,17 @@ _AGENT_LABELS = {
 
 def build_reply_node(chat_responder: ChatResponder):
     async def reply(state: WorkflowState) -> dict:
-        if state.get("intent") in {"create", "edit"}:
+        is_execution = (
+            state.get("intent") in {"create", "edit"}
+            and state.get("execute") is True
+        )
+        if is_execution:
             if state.get("ppt_context_error"):
                 action_label = "创建" if state.get("intent") == "create" else "编辑"
                 content = f"无法{action_label} PPT：{state['ppt_context_error']}"
                 return {
-                    "messages": [
-                        AIMessage(
-                            content=content,
-                            additional_kwargs={
-                                "workflow_reply_kind": CREATE_REPLY_MARKER,
-                            },
-                        )
-                    ]
+                    "final_response": content,
+                    "final_response_mode": "complete",
                 }
 
             completed_agents = state.get("completed_agents", [])
@@ -50,14 +45,8 @@ def build_reply_node(chat_responder: ChatResponder):
                     content += f"（已完成：{completed_text}）"
                 content += "。"
                 return {
-                    "messages": [
-                        AIMessage(
-                            content=content,
-                            additional_kwargs={
-                                "workflow_reply_kind": CREATE_REPLY_MARKER,
-                            },
-                        )
-                    ]
+                    "final_response": content,
+                    "final_response_mode": "complete",
                 }
 
             filename = state.get("filename")
@@ -72,17 +61,11 @@ def build_reply_node(chat_responder: ChatResponder):
             else:
                 content = "本轮 PPT 流程已结束，但没有检测到可用的 PPT 文件。"
 
-            # Create 回复不调用 LLM，没有 on_chat_model_stream 事件；这个标记
-            # 让 streaming.py 在 Node 结束时把确定性文案发送给前端。
+            # Create/Edit 回复不调用 LLM，因此由 streaming.py 在 Node 结束时
+            # 根据 complete 模式把确定性文案一次性发送给前端。
             return {
-                "messages": [
-                    AIMessage(
-                        content=content,
-                        additional_kwargs={
-                            "workflow_reply_kind": CREATE_REPLY_MARKER,
-                        },
-                    )
-                ]
+                "final_response": content,
+                "final_response_mode": "complete",
             }
 
         # Chat 回复由无 Tools 的 ChatResponder 流式生成。
@@ -90,11 +73,14 @@ def build_reply_node(chat_responder: ChatResponder):
             chunk
             async for chunk in chat_responder.stream(
                 user_message=state["user_message"],
-                # 去掉 Workflow 自己的 Overview SystemMessage 和当前用户消息；
-                # ChatResponder 会添加自己的 System Prompt 与当前输入。
-                history=state.get("messages", [])[1:-1],
+                # history 是进入 Graph 前加载的固定 Redis 快照，不含当前输入；
+                # ChatResponder 会添加自己的 System Prompt 与 user_message。
+                history=state.get("conversation_history", []),
             )
         ]
-        return {"messages": [AIMessage(content="".join(chunks))]}
+        return {
+            "final_response": "".join(chunks),
+            "final_response_mode": "streamed",
+        }
 
     return reply

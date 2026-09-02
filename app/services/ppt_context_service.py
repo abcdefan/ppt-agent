@@ -51,6 +51,73 @@ class PptContextService:
             title=title,
         )
 
+    async def get_session_active_ppt_id(
+        self,
+        *,
+        session_id: str,
+        user_id: int,
+    ) -> str | None:
+        """从 MySQL 读取 Session 的权威 Active PPT。"""
+        session = await self.session_repository.get(
+            session_id=session_id,
+            user_id=user_id,
+        )
+        if session is None:
+            return None
+        active_ppt_id = session.get("active_ppt_id")
+        return active_ppt_id if isinstance(active_ppt_id, str) else None
+
+    async def get_editable_ppt(
+        self,
+        *,
+        user_id: int,
+        ppt_id: str,
+    ) -> dict[str, Any] | None:
+        """只返回用户在平台生成且已经可以编辑的 PPT。"""
+        ppt = await self.ppt_repository.get(ppt_id=ppt_id, user_id=user_id)
+        if ppt is None:
+            return None
+        # 真实表字段均为非空；允许缺失值是为了兼容旧记录/轻量测试替身。
+        if ppt.get("source_type") not in {None, "GENERATED"}:
+            return None
+        if ppt.get("lifecycle_status") not in {None, "READY"}:
+            return None
+        return ppt
+
+    async def list_edit_candidates(
+        self,
+        *,
+        user_id: int,
+    ) -> list[dict[str, Any]]:
+        """列出用户在本平台生成的全部可编辑 PPT，供 HITL 选择。"""
+        records = await self.ppt_repository.list_by_user(
+            user_id=user_id,
+            lifecycle_status="READY",
+            source_type="GENERATED",
+            limit=None,
+        )
+        candidates: list[dict[str, Any]] = []
+        for record in records:
+            updated_at = record.get("updated_at")
+            if hasattr(updated_at, "isoformat"):
+                updated_at = updated_at.isoformat()
+            elif updated_at is not None:
+                updated_at = str(updated_at)
+            candidates.append(
+                {
+                    "ppt_id": str(record["ppt_id"]),
+                    "title": (
+                        record.get("title")
+                        or record.get("current_filename")
+                        or "未命名 PPT"
+                    ),
+                    "filename": record.get("current_filename"),
+                    "style": record.get("style") or "business",
+                    "updated_at": updated_at,
+                }
+            )
+        return candidates
+
     async def initialize_create(
         self,
         *,
@@ -130,13 +197,14 @@ class PptContextService:
             )
             ppt = None
             if requested_ppt_id is not None:
-                ppt = await self.ppt_repository.get(
+                ppt = await self.get_editable_ppt(
                     ppt_id=requested_ppt_id,
                     user_id=user_id,
                 )
                 if ppt is None:
                     raise PptOwnershipError(
-                        f"PPT 不存在或不属于当前用户: {requested_ppt_id}"
+                        f"PPT 不存在、不属于当前用户或尚不可编辑: "
+                        f"{requested_ppt_id}"
                     )
                 await self.session_ppt_repository.link(
                     session_id=session_id,
@@ -185,6 +253,55 @@ class PptContextService:
                 run = refreshed_run
         return {"ppt": ppt, "run": run}
 
+    async def ensure_edit_waiting_run(
+        self,
+        *,
+        user_id: int,
+        session_id: str,
+        run_id: str,
+        message: str,
+        waiting_payload: dict[str, Any],
+        checkpoint_thread_id: str | None = None,
+        graph_version: str = "v1",
+    ) -> dict[str, Any]:
+        """幂等创建等待选择的 Edit Run。
+
+        ``interrupt()`` 恢复时 Resolve Node 会从头执行，所以恢复路径必须先
+        复用已经处于 WAITING_INPUT 的 Run，不能再次插入同一个 run_id。
+        """
+        existing = await self.run_repository.get(run_id=run_id, user_id=user_id)
+        if existing is None:
+            return await self.initialize_edit(
+                user_id=user_id,
+                session_id=session_id,
+                run_id=run_id,
+                message=message,
+                requested_ppt_id=None,
+                waiting_payload=waiting_payload,
+                checkpoint_thread_id=checkpoint_thread_id,
+                graph_version=graph_version,
+            )
+
+        if str(existing.get("intent", "")).upper() != "EDIT":
+            raise WorkflowRunConflictError(f"Workflow Run 不是 Edit 类型: {run_id}")
+        if str(existing.get("session_id")) != session_id:
+            raise WorkflowRunConflictError(
+                f"Workflow Run 与 Session 不匹配: {run_id}"
+            )
+
+        status = existing.get("run_status")
+        if status == "WAITING_INPUT":
+            return {"ppt": None, "run": existing}
+        if status == "RUNNING":
+            ppt_id = existing.get("ppt_id")
+            if isinstance(ppt_id, str) and ppt_id:
+                ppt = await self.get_editable_ppt(user_id=user_id, ppt_id=ppt_id)
+                if ppt is not None:
+                    return {"ppt": ppt, "run": existing}
+        raise WorkflowRunConflictError(
+            f"Workflow Run 当前状态不可用于目标选择: {run_id} ({status})"
+        )
+
     async def bind_edit_target(
         self,
         *,
@@ -194,14 +311,16 @@ class PptContextService:
         expected_revision: int,
         association_source: str = "SELECTED",
     ) -> dict[str, Any]:
-        """用户在 HITL 中选择/上传 PPT 后，原子绑定并恢复 Run。"""
+        """用户在 HITL 中选择 PPT 后，原子绑定并恢复 Run。"""
         async with self.db.transaction():
             run = await self.run_repository.get(run_id=run_id, user_id=user_id)
             if run is None:
                 raise WorkflowRunConflictError(f"Workflow Run 不存在: {run_id}")
-            ppt = await self.ppt_repository.get(ppt_id=ppt_id, user_id=user_id)
+            ppt = await self.get_editable_ppt(user_id=user_id, ppt_id=ppt_id)
             if ppt is None:
-                raise PptOwnershipError(f"PPT 不存在或不属于当前用户: {ppt_id}")
+                raise PptOwnershipError(
+                    f"PPT 不存在、不属于当前用户或尚不可编辑: {ppt_id}"
+                )
 
             session_id = str(run["session_id"])
             await self.session_ppt_repository.link(
@@ -225,6 +344,43 @@ class PptContextService:
                     f"Workflow Run 已被其他请求恢复或 revision 不匹配: {run_id}"
                 )
         return {"ppt": ppt, "run_id": run_id, "session_id": session_id}
+
+    async def load_edit_resume_context(
+        self,
+        *,
+        user_id: int,
+        run_id: str,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        """Validate an Edit Run before submitting a LangGraph resume command."""
+        run = await self.run_repository.get(run_id=run_id, user_id=user_id)
+        if run is None:
+            raise WorkflowRunConflictError(
+                f"Workflow Run 不存在或不属于当前用户: {run_id}"
+            )
+        if str(run.get("intent", "")).upper() != "EDIT":
+            raise WorkflowRunConflictError(
+                f"Workflow Run 不是 Edit 类型，无法提交 PPT 选择: {run_id}"
+            )
+        if run.get("run_status") != "WAITING_INPUT":
+            raise WorkflowRunConflictError(
+                f"Workflow Run 当前不在等待输入: {run_id} "
+                f"({run.get('run_status')})"
+            )
+        if run.get("waiting_type") != "PPT_TARGET_REQUIRED":
+            raise WorkflowRunConflictError(
+                f"Workflow Run 等待的不是 PPT 目标选择: {run_id}"
+            )
+        if run.get("revision") != expected_revision:
+            raise WorkflowRunConflictError(
+                f"Workflow Run revision 已变更，请刷新后重试: {run_id}"
+            )
+        checkpoint_thread_id = run.get("checkpoint_thread_id")
+        if not isinstance(checkpoint_thread_id, str) or not checkpoint_thread_id:
+            raise WorkflowRunConflictError(
+                f"Workflow Run 缺少 checkpoint thread ID: {run_id}"
+            )
+        return run
 
     async def load_create_resume_context(
         self,

@@ -1,17 +1,16 @@
 """Workflow 中所有节点共享的状态结构。
 
-State 是比对话消息更丰富的工作流上下文。我们把大纲、文件名、路由结果等
-关键业务信息定义为固定字段，由代码负责更新和传递，降低关键信息在 LLM
-自然语言转述过程中丢失或被改写的风险。
+State 把“跨轮会话快照”和“本轮业务产物”分开保存：Workflow 入口只从
+Redis 加载一次 conversation_history，并单独保存当前 user_message；Graph
+执行期间所有节点读取同一份快照，不再维护会不断增长的公共 messages。
 
-``messages`` 只是 State 中负责保存对话上下文的字段。各 Specialist Agent
-完成工作后，会把业务结果写回 State，供后续节点直接读取。
+各 Specialist Agent 内部仍然使用自己的 messages 完成一次 ReAct 调用，但
+只把提取后的业务结果写回本 State，供后续节点直接读取。
 """
 
 from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.messages import BaseMessage
-from langgraph.graph.message import add_messages
 
 # Workflow 的业务阶段。Image/Chart/PPT Writer 被封装在 assets 阶段内部。
 WorkflowStage = Literal[
@@ -24,6 +23,10 @@ WorkflowStage = Literal[
 
 # 当前 Edit Supervisor 使用的下一阶段；Create 只在最终持久化前写入 FINISH。
 WorkflowRoute = Literal[
+    "research",
+    "outline",
+    "content",
+    "planner",
     "assets",
     "beautify",
     "FINISH",
@@ -82,77 +85,93 @@ def merge_attempt_counts(
 class WorkflowState(TypedDict):
     """一次 Workflow 调用期间，由所有 Graph Node 共同读写的 State。"""
 
-    # 对话消息上下文。add_messages 是该字段的合并函数：节点返回新消息时，
-    # LangGraph 会执行 add_messages(已有消息, 新消息)，而不是覆盖已有消息。
-    messages: Annotated[list[BaseMessage], add_messages]
-
-    # 本次请求的基础信息，由 Workflow 入口写入。
-    user_id: int
-    run_id: str
+    # Redis 在本轮进入 Graph 前加载的跨轮会话快照，不包含当前 user_message；
+    # 本轮执行和 HITL 恢复期间保持不变，节点不得向其中追加内部协作消息。
+    conversation_history: list[BaseMessage]
+    # 当前 HTTP 请求的用户输入；与 conversation_history 分开，避免重复拼接。
     user_message: str
-    session_id: str
-    style: str
-    requested_action: Literal["create", "edit"] | None
-    # requested_ppt_id 是调用方可选的显式目标；ppt_id 是初始化/解析后
-    # 本轮真正操作的 PPT。active_ppt_id 仅用于 Intent Router 提示。
-    requested_ppt_id: str | None
-    active_ppt_id: str | None
-    ppt_id: str | None
-    ppt_context_error: str | None
-    workflow_error: str | None
+    # Reply Node 生成的最终用户可见文本；Runner 和流式适配层从这里读取结果。
+    final_response: str | None
+    # streamed 表示 Chat 已逐 Token 输出；complete 表示 Create/Edit 需整段输出。
+    final_response_mode: Literal["streamed", "complete"] | None
 
-    # Specialist Agents 的业务产物。
-    # Research 根据用户需求写入 research_report，Outline 读取报告后写入
-    # outline，Content 再读取两者并同时写入 filename 和 slides_manifest；
-    # 后续 Planner 与增强节点读取页面清单，Image、Chart 和 Beautify 再通过
-    # filename 操作同一个 PPT 文件。
+    # 当前登录用户 ID；用于所有 MySQL 权限校验和业务记录归属判断。
+    user_id: int
+    # 本次 Workflow Run ID，同时作为 LangGraph checkpoint 的 thread_id。
+    run_id: str
+    # 当前会话 ID；Redis conversation memory 与 Session Active PPT 均按它隔离。
+    session_id: str
+    # 本轮 PPT 视觉风格；未显式指定时由入口写入 business。
+    style: str
+    # 前端显式指定的 create/edit；为空时由 Intent Router 结合上下文判断。
+    requested_action: Literal["create", "edit"] | None
+    # 调用方显式传入的目标 PPT ID；当前产品流程通常为空，保留作兼容入口。
+    requested_ppt_id: str | None
+    # 当前 Session 记录的活动 PPT，仅是 Edit 目标候选，必须先经过内容核验。
+    active_ppt_id: str | None
+    # 本轮实际创建或编辑的 PPT ID；入口为空，由 Initialize/Resolve Node 写入。
+    ppt_id: str | None
+    # PPT 初始化、解析、权限或数据恢复失败原因；Reply Node 据此生成失败回复。
+    ppt_context_error: str | None
+    # Specialist、Planner、Writer 等业务阶段的不可恢复错误。
+    workflow_error: str | None
+    # LLM 根据用户要求与 Active PPT 真实内容判断是否可直接沿用当前目标。
+    edit_target_matches_active: bool | None
+    # 上述保守判断的理由；先落 checkpoint，HITL 恢复时无需重新调用匹配 LLM。
+    edit_target_match_reason: str | None
+
+    # Outline Specialist 生成或从 ppt_record 恢复的页面大纲。
     outline: str | None
+    # Research Specialist 生成或从 ppt_record 恢复的结构化调研报告。
     research_report: str | None
+    # Content 生成或从 ppt_record 恢复的真实 PPTX 文件名。
     filename: str | None
+    # PPT 每页真实内容清单；Planner、Assets 和持久化节点以它为准。
     slides_manifest: list[dict[str, Any]] | None
 
-    # Image/Chart 在生产子图中只准备资源并写入结构化操作；ppt_writer_node
-    # 是唯一 PPT Writer，负责汇总这些操作后一次性提交。
+    # Image/Chart 并行分支准备的结构化文件写入操作，按 operation_id 合并去重。
     asset_operations: Annotated[
         list[dict[str, Any]],
         merge_asset_operations,
     ]
+    # PPT Writer 对本轮 Assets 的最终处理状态。
     asset_apply_status: Literal["pending", "succeeded", "skipped", "failed"]
+    # 已成功写入的资源操作 ID，用于观测和后续幂等扩展。
     applied_operation_ids: list[str]
-    # Create 的 Enhancement Planner 或 Edit Supervisor 写入；Assets 子图
-    # 据此动态选择 Image、Chart、两者并行或跳过。
+    # Planner/Supervisor 选择的资源任务；Assets 子图据此执行 image/chart。
     asset_tasks: list[AssetTask]
 
-    # Specialist 的内部 Tool Call 消息不进入公共 messages；工作流通过
-    # 这个结构化字段判断哪些节点已经完成。
+    # 已完成的 Specialist/Writer 角色；内部 ReAct messages 不进入公共 State。
     completed_agents: Annotated[
         list[WorkflowAgentRole],
         merge_completed_agents,
     ]
 
-    # Create 初始化时先写入 Research/Outline/Content，Content 生成文件并写回
-    # slides_manifest 后，由 Enhancement Planner 一次性追加可选阶段；当前
-    # Edit 由专用 Supervisor 规划。规划完成后通常冻结；可选增强重试耗尽并
-    # 降级交付时，可以移除对应的非关键阶段。
+    # 本轮必须完成的业务阶段；Create Planner 可追加 Assets/Beautify。
     required_stages: list[WorkflowStage]
+    # 已完成的业务阶段，使用 reducer 去重合并并保持首次完成顺序。
     completed_stages: Annotated[
         list[WorkflowStage],
         merge_completed_stages,
     ]
+    # Create Enhancement Planner 是否已经运行并冻结了可选阶段计划。
     requirements_initialized: bool
 
-    # Edit Supervisor 写入下一步路由；Create 只在收尾时写入 FINISH。
+    # Edit Supervisor 选择的下一阶段；Create 仅在收尾时使用 FINISH。
     next: WorkflowRoute | None
 
-    # 节点级重试。attempt_error 记录最近一次可重试失败的原因（达到重试
-    # 上限后由 Finalize 提升为 workflow_error）；attempt_counts 按节点名
-    # 记录"已尝试次数"（每次执行都 +1，含成功那次），路由据此比较
-    # agent_max_attempts 上限，决定回指自身重试还是失败收尾/降级。
+    # 最近一次可重试失败原因；成功、降级或提升为 workflow_error 后清空。
     attempt_error: str | None
+    # 各可重试节点的已执行次数，按节点名合并最新计数。
     attempt_counts: Annotated[dict[str, int], merge_attempt_counts]
 
-    # Intent Router 的本轮结果；这些字段只参与执行和观测，不持久化。
+    # Intent Router 的本轮分类结果。
     intent: WorkflowIntent | None
+    # 用户是否明确要求本轮立即执行 Create/Edit；不确定时必须为 False。
+    execute: bool
+    # Intent 的决策来源：显式操作、向量匹配、LLM 或安全回退。
     route_source: WorkflowRouteSource | None
+    # 路由置信度；只有能够计算置信度的来源才有值。
     route_confidence: float | None
+    # 最近一次 Intent/Planner/Supervisor/降级决策的可观测理由。
     route_reason: str | None

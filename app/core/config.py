@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     agent_max_plan_steps: int = 8  # 计划最大步骤数
     agent_enable_plan_review: bool = True  # 是否启用计划审查
     agent_multi_recursion_limit: int = 50  # 多 Agent 编排的最大图递归步数
+    # LangGraph Checkpoint 只用于短期 HITL 恢复。Redis Saver 的 TTL
+    # 单位是分钟，默认 24 小时；恢复读取时重新计时。
+    agent_checkpoint_ttl_minutes: int = 24 * 60
+    agent_checkpoint_refresh_on_read: bool = True
     # 节点级重试上限：各节点最多尝试次数（含首次执行）。state.attempt_counts
     # 每次执行都 +1，未达上限时路由回指自身重试，达到上限后进入失败收尾
     # （outline/content）或降级继续（research/planner/beautify）。Assets 属于

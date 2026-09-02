@@ -146,6 +146,7 @@ class WorkflowRunRepository:
                 self.table.c.run_id == run_id,
                 self.table.c.user_id == user_id,
                 self.table.c.run_status == "WAITING_INPUT",
+                self.table.c.waiting_type == "PPT_TARGET_REQUIRED",
                 self.table.c.revision == expected_revision,
             )
             .values(

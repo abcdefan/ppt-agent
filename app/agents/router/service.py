@@ -16,15 +16,29 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-INTENT_ROUTER_PROMPT = """你是 PPTCreator 的入口意图分类器。
+INTENT_ROUTER_PROMPT = """你是 PPTCreator 的入口请求路由器。
 
-只允许选择以下三种意图：
+先判断用户讨论的语义意图，只允许以下三种：
 - chat：问候、闲聊、知识问答、解释概念或普通对话，不要求生成 PPT 文件。
 - create：用户要求制作、创建、生成演示文稿、幻灯片或 PPT 文件。
 - edit：用户要求修改、替换、美化、增删已有 PPT 的图片、图表或视觉样式。
 
-结合当前用户消息和少量近期上下文判断。不要因为系统是 PPTCreator 就把普通问题判为 create。
-必须返回 JSON：{"intent": "chat/create/edit", "reason": "一句话理由"}。
+再独立判断 execute，表示用户是否明确要求本轮立即执行 Create/Edit 文件操作：
+- 完整、直接、可立即操作的创建/修改命令，execute=true；不强制要求固定口令。
+- 当前消息明确要求“开始做、开始修改、按上面要求执行”等，结合近期上下文
+  可以确定此前收集的是 Create 或 Edit 时，execute=true。
+- 用户只表达计划、讨论方案、准备继续描述、要求先听后续诉求，execute=false。
+- 用户说“先不要做、等我说完、还有要求”等，execute=false，即使历史中曾要求执行。
+- 信息不足或不确定是否应该开始时，execute=false。
+- intent=chat 时 execute 必须为 false。
+
+近期上下文用于理解“上面的要求”和正在讨论的任务；是否执行以当前用户消息为主，
+不能仅凭历史中的执行措辞启动本轮操作。不要因为系统是 PPTCreator 就把普通问题
+判为 create，也不要因为出现“创建、修改”等词就自动令 execute=true。
+
+如果输入中提供了“已确定语义意图”，必须保持该 intent，只判断 execute。
+必须返回 JSON：
+{"intent":"chat/create/edit","execute":true/false,"reason":"一句话理由"}。
 """
 
 
@@ -63,19 +77,25 @@ class IntentRouterService:
                 logger.info("[IntentRouter] Embedding 意图原型初始化完成")
             except Exception as exc:
                 self._embedding_disabled = True
-                logger.warning("[IntentRouter] Embedding 初始化失败，降级到 LLM: %s", exc)
+                logger.warning(
+                    "[IntentRouter] Embedding 初始化失败，降级到 LLM: %s", exc
+                )
 
     async def route(self, context: RouteContext) -> RouteDecision:
-        if context.requested_action in {"create", "edit"}:
-            return RouteDecision(
-                intent=context.requested_action,
-                source="explicit",
-                confidence=1.0,
-                reason=f"用户通过前端明确选择{context.requested_action} PPT",
-            )
+        intent_hint = None
+        intent_source = "llm"
+        intent_confidence = None
+        intent_reason = ""
 
-        await self.initialize()
-        if self._intent_index is not None:
+        if context.requested_action in {"create", "edit"}:
+            intent_hint = context.requested_action
+            intent_source = "explicit"
+            intent_confidence = 1.0
+            intent_reason = f"前端明确指定 {context.requested_action} 意图"
+        else:
+            await self.initialize()
+
+        if intent_hint is None and self._intent_index is not None:
             try:
                 top_intent, top_score, second_score = await self._intent_index.match(
                     context.user_message
@@ -86,29 +106,30 @@ class IntentRouterService:
                     and top_score >= settings.intent_embedding_min_score
                     and margin >= settings.intent_embedding_margin
                 ):
-                    return RouteDecision(
-                        intent=top_intent,
-                        source="embedding",
-                        confidence=max(0.0, min(1.0, top_score)),
-                        reason=(
-                            f"Embedding 高置信命中，score={top_score:.3f}, "
-                            f"margin={margin:.3f}"
-                        ),
+                    intent_hint = top_intent
+                    intent_source = "embedding"
+                    intent_confidence = max(0.0, min(1.0, top_score))
+                    intent_reason = (
+                        f"Embedding 高置信命中，score={top_score:.3f}, "
+                        f"margin={margin:.3f}"
                     )
-                logger.info(
-                    "[IntentRouter] Embedding 低置信: top=%s score=%.3f margin=%.3f",
-                    top_intent,
-                    top_score,
-                    margin,
-                )
+                else:
+                    logger.info(
+                        "[IntentRouter] Embedding 低置信: top=%s score=%.3f margin=%.3f",
+                        top_intent,
+                        top_score,
+                        margin,
+                    )
             except Exception as exc:
                 logger.warning("[IntentRouter] Embedding 匹配失败，降级到 LLM: %s", exc)
 
+        intent_hint_text = intent_hint or "无，由你判断"
         briefing = (
             f"当前用户消息：{context.user_message}\n"
             f"当前活动 PPT ID：{context.active_ppt_id or '无'}\n"
             f"当前风格：{context.style}\n"
-            "请输出意图分类 JSON。"
+            f"已确定语义意图：{intent_hint_text}\n"
+            "请输出意图与是否立即执行的 JSON。"
         )
         try:
             result = await self._structured_llm.ainvoke(
@@ -118,17 +139,28 @@ class IntentRouterService:
                     HumanMessage(content=briefing),
                 ]
             )
+            final_intent = intent_hint or result.intent
+            execute = bool(result.execute) if final_intent != "chat" else False
+            reason = result.reason
+            if intent_reason:
+                reason = f"{intent_reason}；{reason}"
             return RouteDecision(
-                intent=result.intent,
-                source="llm",
-                confidence=None,
-                reason=result.reason,
+                intent=final_intent,
+                execute=execute,
+                source=intent_source,
+                confidence=intent_confidence,
+                reason=reason,
             )
         except Exception as exc:
-            logger.warning("[IntentRouter] LLM 分类失败，安全回退 chat: %s", exc)
+            logger.warning("[IntentRouter] LLM 路由失败，安全禁止执行: %s", exc)
             return RouteDecision(
-                intent="chat",
-                source="fallback",
-                confidence=None,
-                reason="意图识别服务不可用，安全回退普通对话",
+                intent=intent_hint or "chat",
+                execute=False,
+                source=intent_source if intent_hint else "fallback",
+                confidence=intent_confidence,
+                reason=(
+                    f"{intent_reason}；执行判断不可用，安全禁止执行"
+                    if intent_reason
+                    else "意图与执行判断不可用，安全回退普通对话"
+                ),
             )

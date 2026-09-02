@@ -31,11 +31,17 @@ def build_persist_node(
         state_filename = state.get("filename")
         filename = Path(state_filename).name if state_filename else None
         is_final = state.get("next") == "FINISH"
-        current_stage = (
-            "FINALIZE"
-            if is_final
-            else (completed_stages[-1].upper() if completed_stages else "INITIALIZE")
-        )
+        current_route = state.get("next")
+        if is_final:
+            current_stage = "FINALIZE"
+        elif state.get("intent") == "edit" and current_route:
+            # Edit 加载的是 PPT 历史产物集合；本轮实际完成的阶段就是
+            # Supervisor 最近选择、随后汇聚到 Persist 的 next。
+            current_stage = current_route.upper()
+        else:
+            current_stage = (
+                completed_stages[-1].upper() if completed_stages else "INITIALIZE"
+            )
         await ppt_context_service.persist_progress(
             user_id=user_id,
             run_id=run_id,
@@ -71,4 +77,6 @@ def build_persist_node(
 
 
 def route_after_persist(state: WorkflowState) -> str:
-    return "finish" if state.get("next") == "FINISH" else "continue"
+    if state.get("workflow_error") or state.get("next") == "FINISH":
+        return "finish"
+    return "continue"

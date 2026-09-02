@@ -12,7 +12,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
 from app.agents.specialists.agent_registry import build_specialist_agent
 from app.agents.specialists.research_agent import (
@@ -55,7 +55,9 @@ def build_specialist_node(
     async def run_specialist(state: WorkflowState) -> dict[str, Any]:
         """根据 State 调用专家，并返回 State 的局部更新。"""
         task = _build_specialist_task(agent_role, state)
-        retryable = agent_role in RETRYABLE_SPECIALIST_ROLES
+        is_edit = state.get("intent") == "edit"
+        # Edit 的节点失败直接结束本轮 Run，不使用 Create 的节点级重试或降级。
+        retryable = agent_role in RETRYABLE_SPECIALIST_ROLES and not is_edit
         attempts = (
             state.get("attempt_counts", {}).get(agent_role, 0) + 1
             if retryable
@@ -68,18 +70,17 @@ def build_specialist_node(
                     "messages": [
                         HumanMessage(content=task),
                     ]
-                }
+                },
+                config={
+                    # 限制单次 Specialist Agent 内部的 ReAct 图步数，避免模型
+                    # 持续在“思考 -> 调用工具 -> 再思考”之间循环。它与外层
+                    # Workflow 的节点重试次数 agent_max_attempts 相互独立。
+                    "recursion_limit": settings.agent_max_react_iterations,
+                },
             )
         except Exception as exc:
             logger.exception("Specialist 执行失败: role=%s", agent_role)
-            patch: dict[str, Any] = {
-                "messages": [
-                    HumanMessage(
-                        content=f"{agent_role} 专家执行失败：{exc}",
-                        name=agent_role,
-                    )
-                ]
-            }
+            patch: dict[str, Any] = {}
             if retryable:
                 patch["attempt_counts"] = {agent_role: attempts}
             # Image/Chart 可能处于并行分支，不写同一个标量错误字段，避免
@@ -97,12 +98,6 @@ def build_specialist_node(
                             "completed_stages": ["research"],
                             "attempt_error": None,
                             "route_reason": "调研专家连续执行失败，已降级为空报告继续",
-                            "messages": [
-                                HumanMessage(
-                                    content="research 专家重试耗尽，已降级为空报告继续",
-                                    name="research",
-                                )
-                            ],
                         }
                     )
                 elif agent_role == "beautify" and attempts >= max_attempts:
@@ -115,12 +110,6 @@ def build_specialist_node(
                             ],
                             "attempt_error": None,
                             "route_reason": "美化连续执行失败，已降级交付未美化版本",
-                            "messages": [
-                                HumanMessage(
-                                    content="beautify 专家重试耗尽，已降级交付未美化版本",
-                                    name="beautify",
-                                )
-                            ],
                         }
                     )
             elif agent_role not in {"image", "chart"}:
@@ -138,9 +127,8 @@ def build_specialist_node(
         # }
         # Outline 通常不调用业务工具，因此可能只有 HumanMessage 和 AIMessage。
 
-        # result_messages 只在当前 Specialist Node 内部使用。这里会从中提取
-        # 可靠业务结果，但绝不能把 Tool Call/Tool Result 原样合并到 Workflow
-        # 的公共 messages，否则后续规划节点截取上下文时可能破坏工具消息配对。
+        # result_messages 只在当前 Specialist Node 内部使用。这里从 ReAct
+        # 轨迹中提取可靠业务结果，绝不把 Tool Call/Tool Result 写入父 State。
         result_messages = result.get("messages", [])
 
         patch: dict[str, Any] = {}
@@ -220,19 +208,12 @@ def build_specialist_node(
             if retryable:
                 patch["attempt_error"] = None
 
-        if agent_role == "content" and patch.get("filename"):
-            summary = f"content 专家已完成，基础 PPT 已生成：{patch['filename']}"
-        elif agent_role == "research" and completed:
-            summary = "research 专家已完成本轮联网调研"
-        elif completed:
-            summary = f"{agent_role} 专家已完成本轮任务"
-        else:
-            summary = f"{agent_role} 专家本轮执行结束，但未产生有效业务结果"
-
-        # 公共消息只保留普通文本摘要，绝不暴露 Specialist 的私有 ToolMessage。
-        patch["messages"] = [
-            HumanMessage(content=summary, name=agent_role),
-        ]
+        if is_edit and not completed and agent_role in RETRYABLE_SPECIALIST_ROLES:
+            failure_reason = patch.pop(
+                "attempt_error",
+                f"{agent_role} 阶段未产生有效业务产物",
+            )
+            patch["workflow_error"] = failure_reason
 
         return patch
 
@@ -303,7 +284,15 @@ def _build_specialist_task(
     state: WorkflowState,
 ) -> str:
     """从 State 取得当前专家需要的上下文并组成任务。"""
-    base_context = f"用户原始需求：{state['user_message']}\nPPT 风格：{state['style']}"
+    history_context = _render_conversation_history(
+        state.get("conversation_history", [])
+    )
+    base_context = (
+        "用户此前在本 Session 中的需求与讨论：\n"
+        f"{history_context}\n\n"
+        f"用户本轮请求：{state['user_message']}\n"
+        f"PPT 风格：{state['style']}"
+    )
 
     if agent_role == "outline":
         research_report = state.get("research_report")
@@ -366,6 +355,30 @@ def _build_specialist_task(
         f"{enhancement_context}"
         f"{action_by_role[agent_role]}"
     )
+
+
+def _render_conversation_history(messages: list[BaseMessage]) -> str:
+    """把入口加载的只读历史快照渲染成 Specialist Task 的背景信息。"""
+    if not messages:
+        return "（当前 Session 没有历史对话）"
+
+    role_labels = {
+        "system": "历史摘要",
+        "human": "用户",
+        "ai": "助手",
+    }
+    rendered: list[str] = []
+    for message in messages:
+        content = (
+            message.content
+            if isinstance(message.content, str)
+            else str(message.content)
+        )
+        if not content.strip():
+            continue
+        label = role_labels.get(message.type, message.type)
+        rendered.append(f"[{label}] {content.strip()}")
+    return "\n".join(rendered) or "（当前 Session 没有有效历史对话）"
 
 
 def _extract_final_ai_text(messages: list) -> str:

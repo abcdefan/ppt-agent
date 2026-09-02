@@ -14,11 +14,12 @@ def build_intent_router_node(router: IntentRouterService):
                 requested_action=state.get("requested_action"),
                 active_ppt_id=state.get("active_ppt_id"),
                 style=state.get("style") or "business",
-                recent_messages=state.get("messages", []),
+                recent_messages=state.get("conversation_history", []),
             )
         )
         return {
             "intent": decision.intent,
+            "execute": decision.execute,
             "route_source": decision.source,
             "route_confidence": decision.confidence,
             "route_reason": decision.reason,
@@ -28,6 +29,8 @@ def build_intent_router_node(router: IntentRouterService):
                     "ppt_id": None,
                     "ppt_context_error": None,
                     "workflow_error": None,
+                    "edit_target_matches_active": None,
+                    "edit_target_match_reason": None,
                     "outline": None,
                     "research_report": None,
                     "filename": None,
@@ -37,7 +40,7 @@ def build_intent_router_node(router: IntentRouterService):
                     "requirements_initialized": False,
                     "next": None,
                 }
-                if decision.intent in {"create", "edit"}
+                if decision.intent in {"create", "edit"} and decision.execute
                 else {}
             ),
         }

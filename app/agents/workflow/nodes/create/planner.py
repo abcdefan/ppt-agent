@@ -76,6 +76,7 @@ def build_enhancement_planner_node(llm: BaseChatModel):
             decision = await structured_llm.ainvoke(
                 [
                     SystemMessage(content=ENHANCEMENT_PLANNER_PROMPT),
+                    *state.get("conversation_history", []),
                     HumanMessage(
                         content=(
                             f"用户原始需求：{state['user_message']}\n"
@@ -90,6 +91,11 @@ def build_enhancement_planner_node(llm: BaseChatModel):
             )
         except Exception as exc:
             logger.exception("Enhancement Planner 执行失败")
+            if state.get("intent") == "edit":
+                return {
+                    "workflow_error": f"增强规划失败：{exc}",
+                    "attempt_error": None,
+                }
             attempts = state.get("attempt_counts", {}).get("planner", 0) + 1
             if attempts < settings.agent_max_attempts.get("planner", 3):
                 # 还有尝试额度：返回可重试失败，路由回指自身。
@@ -97,14 +103,6 @@ def build_enhancement_planner_node(llm: BaseChatModel):
                     "attempt_counts": {"planner": attempts},
                     "attempt_error": f"增强规划失败：{exc}",
                     "requirements_initialized": False,
-                    "messages": [
-                        HumanMessage(
-                            content=(
-                                f"增强规划失败（第 {attempts} 次尝试），即将重试：{exc}"
-                            ),
-                            name="enhancement_planner_node",
-                        )
-                    ],
                 }
             # 达到上限：降级为基础版本。基础 PPT 已生成，增强只是可选项，
             # 因此不标记失败，仅冻结"无增强"计划并记录降级原因。
@@ -115,12 +113,6 @@ def build_enhancement_planner_node(llm: BaseChatModel):
                 "route_reason": f"增强规划失败，已降级为基础版本：{exc}",
                 "attempt_error": None,
                 "attempt_counts": {"planner": attempts},
-                "messages": [
-                    HumanMessage(
-                        content="增强规划失败，已跳过配图/美化，交付基础版本",
-                        name="enhancement_planner_node",
-                    )
-                ],
             }
 
         asset_tasks = normalize_asset_tasks(decision.asset_tasks)

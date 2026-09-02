@@ -1,9 +1,4 @@
-"""当前 Edit Workflow 的规划与路由节点。
-
-Create 已改为 Enhancement Planner 加确定性子图，不依赖本模块。
-Edit 的完整 Planner/Dispatcher 设计将在后续单独演进；这里暂时只保留
-当前已经实现的 Assets 与 Beautify 能力。
-"""
+"""Edit Workflow 的动态规划与路由节点。"""
 
 from typing import Any, Literal, cast
 
@@ -13,60 +8,76 @@ from pydantic import BaseModel, Field, model_validator
 
 from app.agents.workflow.state import AssetTask, WorkflowState
 
-EditStage = Literal["assets", "beautify"]
-EditRoute = Literal["assets", "beautify", "FINISH"]
+EditStage = Literal[
+    "research",
+    "outline",
+    "content",
+    "planner",
+    "assets",
+    "beautify",
+]
+EditRoute = Literal[
+    "research",
+    "outline",
+    "content",
+    "planner",
+    "assets",
+    "beautify",
+    "FINISH",
+]
 
-EDIT_STAGE_ORDER: tuple[EditStage, ...] = ("assets", "beautify")
+EDIT_ROUTES: set[str] = {
+    "research",
+    "outline",
+    "content",
+    "planner",
+    "assets",
+    "beautify",
+    "FINISH",
+}
 EDIT_SUPERVISOR_NODE = "edit_supervisor_node"
 
-EDIT_SUPERVISOR_PROMPT = """你是 PPT 多智能体团队当前版本的 Edit Supervisor。
-你只负责规划和路由已有 PPT 的图片、图表与视觉美化修改，不直接修改 PPT 文件。
+EDIT_SUPERVISOR_PROMPT = """你是 PPT 多智能体团队的 Edit Supervisor。
+你负责根据用户的修改要求和每个阶段执行后的最新 State，每轮只选择一个下一阶段；
+你不直接修改 PPT，也不需要一次性规划或冻结整条执行路径。
 
 可选择的阶段：
-- assets：准备图片或图表操作，再由 PPT Writer 统一写入 PPT；
-- beautify：对已有 PPT 做视觉优化；
-- FINISH：本轮所有必需阶段已经完成。
+- research：重新检索资料并更新研究报告；
+- outline：重新规划完整页面结构；
+- content：根据当前研究报告和大纲重新生成基础 PPT；
+- planner：根据当前 PPT 内容判断是否需要图片、图表或美化；
+- assets：准备图片/图表操作，再由 PPT Writer 单点写入；
+- beautify：对当前 PPT 做视觉优化；
+- FINISH：本轮修改已经完成。
 
-首次规划时必须返回 required_stages：
-- 修改或替换图片、图表时选择 assets；
-- 调整视觉样式和排版时选择 beautify；
-- 当前版本不要返回其他阶段。
+调度原则：
+1. 结合用户原始要求、当前已有产物和已经执行过的阶段选择下一步；
+2. research 更新后，由你判断是否还需要 outline 或 content；
+3. outline 更新后通常还需要 content；content 重新生成后通常应调用 planner；
+4. 单纯换图或图表可以直接调用 assets，单纯调整视觉风格可以直接 beautify；
+5. 选择 assets 时，通过 asset_tasks 指定 image、chart 或两者；
+6. 不要无理由重复已经执行成功的阶段；确认修改已经落到 PPT 后再 FINISH；
+7. 节点失败由工作流直接失败收尾，不由你进行节点级重试。
 
-如果 required_stages 包含 assets，首次规划还必须返回 asset_tasks：
-- 图片或插图任务加入 image；
-- 图表或数据可视化任务加入 chart；
-- 两类都需要时同时加入 image 和 chart；
-- 不需要 assets 时返回空列表。
-
-后续路由规则：
-1. required_stages 初始化后不可修改；
-2. 不要重复已完成阶段；
-3. 同时需要 assets 和 beautify 时，先执行 assets；
-4. 全部必需阶段完成后才能选择 FINISH。
-
-严格返回 JSON，字段为 next、reason、required_stages、asset_tasks。
-首次规划示例：
-{"next":"assets","reason":"用户要求替换配图","required_stages":["assets"],"asset_tasks":["image"]}
-后续路由示例：
-{"next":"FINISH","reason":"图片修改已经完成","required_stages":null,"asset_tasks":null}
+严格返回 JSON，字段为 next、reason、asset_tasks。
+示例：
+{"next":"research","reason":"需要先获取用户要求的最新资料","asset_tasks":null}
+{"next":"assets","reason":"只需要替换页面配图","asset_tasks":["image"]}
+{"next":"FINISH","reason":"用户要求的修改已经写入 PPT","asset_tasks":null}
 """
 
 
 class EditRouteDecision(BaseModel):
-    """Edit Supervisor LLM 提议的路由结果。"""
+    """Edit Supervisor 每轮提议的下一步。"""
 
     next: EditRoute = Field(description="下一阶段，或 FINISH")
     reason: str = Field(
         default="Edit Supervisor 未提供路由理由",
         description="选择该路由的一句话理由",
     )
-    required_stages: list[EditStage] | None = Field(
-        default=None,
-        description="仅首次规划时返回；后续保持为 null",
-    )
     asset_tasks: list[AssetTask] | None = Field(
         default=None,
-        description="仅首次规划 Assets 时返回 image、chart 或两者",
+        description="next=assets 时选择 image、chart 或两者，否则返回 null",
     )
 
     @model_validator(mode="before")
@@ -82,74 +93,18 @@ class EditRouteDecision(BaseModel):
         return normalized
 
 
-def normalize_edit_stages(proposed: list[EditStage] | None) -> list[EditStage]:
-    """去重并固定当前 Edit 阶段顺序。"""
+def normalize_asset_tasks(proposed: list[AssetTask] | None) -> list[AssetTask]:
+    """去重并固定 Assets 内 Image/Chart 的执行顺序。"""
     selected = set(proposed or [])
-    return [stage for stage in EDIT_STAGE_ORDER if stage in selected]
-
-
-def normalize_asset_tasks(
-    proposed: list[AssetTask] | None,
-    *,
-    assets_required: bool,
-) -> list[AssetTask]:
-    if not assets_required:
-        return []
-    selected = set(proposed or ["image", "chart"])
     return [task for task in ("image", "chart") if task in selected]
-
-
-def _edit_stage_completed(state: WorkflowState, stage: EditStage) -> bool:
-    if stage not in state.get("completed_stages", []):
-        return False
-    if stage == "assets":
-        return state.get("asset_apply_status") in {"succeeded", "skipped"}
-    return True
-
-
-def _next_safe_edit_stage(
-    state: WorkflowState,
-    required_stages: list[EditStage],
-) -> EditRoute:
-    missing = [
-        stage for stage in required_stages if not _edit_stage_completed(state, stage)
-    ]
-    if not missing:
-        return "FINISH"
-    if "assets" in missing:
-        return "assets"
-    return "beautify"
-
-
-def guard_edit_route(
-    state: WorkflowState,
-    proposed_next: EditRoute,
-    required_stages: list[EditStage],
-) -> tuple[EditRoute, str | None]:
-    """阻止 Edit 提前结束、重复执行或跳过 Assets 依赖。"""
-    safe_next = _next_safe_edit_stage(state, required_stages)
-    if proposed_next == "FINISH":
-        if safe_next == "FINISH":
-            return "FINISH", None
-        return safe_next, "必需阶段尚未全部完成，已阻止 FINISH"
-
-    proposed_stage = cast(EditStage, proposed_next)
-    if proposed_stage not in required_stages:
-        return safe_next, f"{proposed_stage} 不属于本轮 required_stages"
-    if _edit_stage_completed(state, proposed_stage):
-        return safe_next, f"{proposed_stage} 已完成，已阻止重复执行"
-    if proposed_stage == "beautify" and "assets" in required_stages:
-        if not _edit_stage_completed(state, "assets"):
-            return safe_next, "assets 尚未完成，已阻止提前美化"
-    return proposed_stage, None
 
 
 def route_after_edit_supervisor(state: WorkflowState) -> EditRoute:
     next_route = state.get("next")
-    return next_route if next_route in {"assets", "beautify", "FINISH"} else "FINISH"
+    return cast(EditRoute, next_route) if next_route in EDIT_ROUTES else "FINISH"
 
 
-def _safe_recent_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
+def _safe_conversation_history(messages: list[BaseMessage]) -> list[BaseMessage]:
     safe_messages = [
         message
         for message in messages
@@ -160,66 +115,47 @@ def _safe_recent_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
 
 
 def build_edit_supervisor_node(llm: BaseChatModel):
-    """创建仅服务当前 Edit 子图的结构化 Supervisor Node。"""
+    """创建每轮只选择一个动作的结构化 Edit Supervisor Node。"""
     structured_llm = llm.with_structured_output(
         EditRouteDecision,
         method="json_mode",
     )
 
     async def run_edit_supervisor(state: WorkflowState) -> dict:
-        initialized = state.get("requirements_initialized", False)
-        existing_required = normalize_edit_stages(state.get("required_stages"))
-        existing_asset_tasks = normalize_asset_tasks(
-            state.get("asset_tasks"),
-            assets_required="assets" in existing_required,
-        )
         state_summary = (
             f"用户本轮修改要求：{state['user_message']}\n"
             f"PPT ID：{state.get('ppt_id') or '尚未解析'}\n"
             f"PPT 风格：{state['style']}\n"
             f"PPT 文件：{state.get('filename') or '尚未生成'}\n"
-            f"requirements_initialized：{initialized}\n"
-            f"required_stages：{existing_required if initialized else '尚未规划'}\n"
-            f"asset_tasks：{existing_asset_tasks if initialized else '尚未规划'}\n"
-            f"completed_stages：{state.get('completed_stages', [])}\n"
-            "请规划或选择下一阶段。"
+            f"研究报告是否存在：{bool(state.get('research_report'))}\n"
+            f"页面大纲是否存在：{bool(state.get('outline'))}\n"
+            f"页面清单是否存在：{bool(state.get('slides_manifest'))}\n"
+            f"PPT 已有产物阶段：{state.get('completed_stages', [])}\n"
+            f"Planner 最近建议：{state.get('required_stages', [])}\n"
+            f"Planner/上轮选择的资源任务：{state.get('asset_tasks', [])}\n"
+            "请根据最新状态只选择一个下一阶段。"
         )
         decision = await structured_llm.ainvoke(
             [
                 SystemMessage(content=EDIT_SUPERVISOR_PROMPT),
-                *_safe_recent_messages(state.get("messages", [])),
+                *_safe_conversation_history(
+                    state.get("conversation_history", [])
+                ),
                 HumanMessage(content=state_summary),
             ]
         )
 
-        required_stages = (
-            existing_required
-            if initialized
-            else normalize_edit_stages(decision.required_stages)
-        )
-        asset_tasks = (
-            existing_asset_tasks
-            if initialized
-            else normalize_asset_tasks(
-                decision.asset_tasks,
-                assets_required="assets" in required_stages,
-            )
-        )
-        next_route, guard_reason = guard_edit_route(
-            state,
-            decision.next,
-            required_stages,
-        )
-        reason = decision.reason
-        if guard_reason:
-            reason = f"{reason}；Route Guard：{guard_reason}，改为 {next_route}"
-
-        return {
-            "next": next_route,
-            "route_reason": reason,
-            "required_stages": required_stages,
-            "asset_tasks": asset_tasks,
-            "requirements_initialized": True,
+        patch: dict[str, Any] = {
+            "next": decision.next,
+            "route_reason": decision.reason,
         }
+        if decision.next == "assets":
+            proposed_tasks = (
+                decision.asset_tasks
+                if decision.asset_tasks is not None
+                else state.get("asset_tasks", [])
+            )
+            patch["asset_tasks"] = normalize_asset_tasks(proposed_tasks)
+        return patch
 
     return run_edit_supervisor

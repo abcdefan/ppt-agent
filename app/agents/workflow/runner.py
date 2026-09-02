@@ -10,8 +10,10 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from uuid import uuid4
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.errors import GraphRecursionError
+from langgraph.types import Command
 
 from app.agents.common.llm import build_llm, build_summary_llm
 from app.agents.router import ChatResponder, IntentRouterService
@@ -35,6 +37,7 @@ from app.schemas.events import (
     AGENT_THINKING,
     DONE,
     ERROR,
+    INPUT_REQUIRED,
     INTENT_ROUTED,
     TEXT_DELTA,
     make_event,
@@ -47,21 +50,16 @@ from app.services import (
 
 logger = logging.getLogger(__name__)
 
-OVERVIEW_PROMPT = (
-    "你正在与 PPTCreator 多智能体团队协作。"
-    "Intent Router 负责业务分流；PPT Workflow 子图中的调研、大纲、内容、"
-    "配图、图表、统一编辑和美化节点负责具体工作。"
-)
-
-
 class WorkflowRunner:
     """Workflow Graph 的非流式/流式执行入口。"""
 
-    def __init__(self):
+    def __init__(self, *, checkpointer: BaseCheckpointSaver):
         # settings.agent_mode=workflow 时，main.py 会在 FastAPI lifespan
         # 阶段创建本 Runner。构建 Graph 时，Planner、Edit Supervisor 和全部
         # Specialist Nodes 也会一次性创建；后续请求复用该 Graph。
         self.llm = build_llm()
+        # Edit 目标核验是分类任务：使用低温、非流式模型，避免判断随机波动。
+        self.target_match_llm = build_llm(temperature=0.0, streaming=False)
         self.memory = SummaryBufferMemory(summary_llm=build_summary_llm())
         self.state_store = SessionStateStore()
         self.ppt_record_store = PptRecordStore()
@@ -69,6 +67,7 @@ class WorkflowRunner:
         self.chat_message_repository = ChatMessageRepository(database)
         self.intent_router = IntentRouterService(self.llm)
         self.chat_responder = ChatResponder(self.llm)
+        self.checkpointer = checkpointer
         if settings.agent_ppt_subgraph_mode == "debug":
             self.create_subgraph = build_debug_ppt_creation_subgraph(
                 self.llm,
@@ -87,6 +86,8 @@ class WorkflowRunner:
             ppt_record_store=self.ppt_record_store,
             ppt_context_service=self.ppt_context_service,
             creation_subgraph=self.create_subgraph,
+            target_match_llm=self.target_match_llm,
+            checkpointer=self.checkpointer,
         )
         self.recursion_limit = settings.agent_multi_recursion_limit
         logger.info(
@@ -123,13 +124,13 @@ class WorkflowRunner:
                 "requested_ppt_id": requested_ppt_id,
             },
         )
-        history = await self.memory.load(session_id)
+        conversation_history = await self.memory.load(session_id)
         session_state = await self.state_store.load(session_id)
         initial_state = self._build_initial_state(
             user_message=user_message,
             session_id=session_id,
             style=style or "business",
-            history=history,
+            conversation_history=conversation_history,
             session_state=session_state,
             requested_action=requested_action,
             requested_ppt_id=requested_ppt_id,
@@ -138,11 +139,15 @@ class WorkflowRunner:
         )
 
         try:
-            # Graph.ainvoke() 接收的是整个初始 State，不是直接把
-            # messages 发给某个 LLM。Graph 会按边依次把 State 交给 Node。
+            # Graph.ainvoke() 接收整个初始 State。每个 Node 从同一份
+            # conversation_history 快照和结构化业务字段中选择所需上下文。
             final_state = await self.graph.ainvoke(
                 initial_state,
-                config={"recursion_limit": self.recursion_limit},
+                config={
+                    "recursion_limit": self.recursion_limit,
+                    "configurable": {"thread_id": effective_run_id},
+                },
+                durability="exit",
             )
         except GraphRecursionError:
             logger.exception("[WorkflowRunner] 会话 %s 超出最大递归步数", session_id)
@@ -182,20 +187,21 @@ class WorkflowRunner:
             )
             raise
 
-        reply = self._last_ai_text(final_state)
+        reply = self._final_response_text(final_state)
+        is_execution = (
+            final_state.get("intent") in {"create", "edit"}
+            and final_state.get("execute") is True
+        )
         await self._archive_assistant_message(
             session_id=session_id,
             user_id=user_id,
             user_message_id=user_record["id"],
             run_id=effective_run_id,
             content=reply,
-            message_type=(
-                "WORKFLOW_RESULT"
-                if final_state.get("intent") in {"create", "edit"}
-                else "TEXT"
-            ),
+            message_type="WORKFLOW_RESULT" if is_execution else "TEXT",
             metadata={
                 "intent": final_state.get("intent"),
+                "execute": final_state.get("execute", False),
                 "ppt_id": final_state.get("ppt_id"),
             },
         )
@@ -218,9 +224,11 @@ class WorkflowRunner:
         started_at = time.monotonic()
         response_parts: list[str] = []
         routed_intent: str | None = None
+        routed_execute = False
         user_message_id: int | None = None
         archived_error: str | None = None
         stream_completed = False
+        waiting_input = False
 
         yield make_event(
             AGENT_THINKING,
@@ -242,14 +250,14 @@ class WorkflowRunner:
                 },
             )
             user_message_id = int(user_record["id"])
-            history = await self.memory.load(session_id)
+            conversation_history = await self.memory.load(session_id)
             session_state = await self.state_store.load(session_id)
             resolved_style = style or "business"
             initial_state = self._build_initial_state(
                 user_message=user_message,
                 session_id=session_id,
                 style=resolved_style,
-                history=history,
+                conversation_history=conversation_history,
                 session_state=session_state,
                 requested_action=requested_action,
                 requested_ppt_id=requested_ppt_id,
@@ -263,12 +271,16 @@ class WorkflowRunner:
                 graph=self.graph,
                 initial_state=initial_state,
                 recursion_limit=self.recursion_limit,
+                thread_id=run_id,
                 on_ppt_created=on_ppt_created,
             ):
                 if event["event"] == TEXT_DELTA:
                     response_parts.append(event["data"].get("content", ""))
                 elif event["event"] == INTENT_ROUTED:
                     routed_intent = event["data"].get("intent")
+                    routed_execute = event["data"].get("execute") is True
+                elif event["event"] == INPUT_REQUIRED:
+                    waiting_input = True
                 yield event
             stream_completed = True
 
@@ -319,12 +331,18 @@ class WorkflowRunner:
                             if archived_error
                             else (
                                 "WORKFLOW_RESULT"
-                                if routed_intent in {"create", "edit"}
+                                if (
+                                    routed_intent in {"create", "edit"}
+                                    and routed_execute
+                                )
                                 else "TEXT"
                             )
                         ),
                         message_status="FAILED" if archived_error else "COMPLETED",
-                        metadata={"intent": routed_intent},
+                        metadata={
+                            "intent": routed_intent,
+                            "execute": routed_execute,
+                        },
                     )
                 except Exception:
                     logger.exception(
@@ -337,6 +355,20 @@ class WorkflowRunner:
                 except Exception:
                     logger.exception(
                         "[WorkflowRunner/流式] 会话 %s 保存记忆失败",
+                        session_id,
+                    )
+            elif waiting_input and user_message_id is not None:
+                # 暂停时还没有最终 Assistant 回复，但 Edit Run 已创建。
+                # 先绑定原始 USER 消息，保证 resume 后的结果与同一 Run
+                # 在 MySQL 中可以完整关联。
+                try:
+                    await self.chat_message_repository.attach_run(
+                        message_id=user_message_id,
+                        run_id=run_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[WorkflowRunner/流式] 会话 %s 绑定等待 Run 失败",
                         session_id,
                     )
 
@@ -353,8 +385,13 @@ class WorkflowRunner:
             DONE,
             {
                 "session_id": session_id,
-                "run_id": run_id if routed_intent in {"create", "edit"} else None,
+                "run_id": (
+                    run_id
+                    if routed_intent in {"create", "edit"} and routed_execute
+                    else None
+                ),
                 "elapsed_seconds": elapsed_seconds,
+                "status": "WAITING_INPUT" if waiting_input else "COMPLETED",
             },
         )
 
@@ -380,6 +417,166 @@ class WorkflowRunner:
             run_id=run_id or f"run-{uuid4().hex}",
         ):
             yield event
+
+    async def run_edit_resume_stream(
+        self,
+        *,
+        user_id: int,
+        run_id: str,
+        ppt_id: str,
+        revision: int,
+    ) -> AsyncIterator[dict]:
+        """Submit a PPT selection and continue the interrupted parent graph."""
+        started_at = time.monotonic()
+        session_id: str | None = None
+        checkpoint_thread_id: str | None = None
+        original_message = ""
+        execution_started = False
+        archive_content: str | None = None
+        archive_failed = False
+        response_parts: list[str] = []
+
+        yield make_event(
+            AGENT_THINKING,
+            {"message": "已收到 PPT 选择，正在恢复编辑流程..."},
+        )
+
+        try:
+            run = await self.ppt_context_service.load_edit_resume_context(
+                user_id=user_id,
+                run_id=run_id,
+                expected_revision=revision,
+            )
+            session_id = str(run["session_id"])
+            checkpoint_thread_id = str(run["checkpoint_thread_id"])
+            input_payload = run.get("input_payload_json") or {}
+            if isinstance(input_payload, dict):
+                original_message = str(input_payload.get("message") or "")
+            execution_started = True
+
+            async for event in stream_workflow_events(
+                graph=self.graph,
+                initial_state=Command(
+                    resume={"ppt_id": ppt_id, "revision": revision}
+                ),
+                recursion_limit=self.recursion_limit,
+                thread_id=checkpoint_thread_id,
+            ):
+                if event["event"] == TEXT_DELTA:
+                    response_parts.append(event["data"].get("content", ""))
+                yield event
+
+            refreshed_run = await self.ppt_context_service.run_repository.get(
+                run_id=run_id,
+                user_id=user_id,
+            )
+            if refreshed_run and refreshed_run.get("run_status") == "SUCCEEDED":
+                archive_content = "".join(response_parts).strip()
+                if not archive_content:
+                    archive_content = "PPT 已修改完成。"
+                    yield make_event(TEXT_DELTA, {"content": archive_content})
+            else:
+                archive_failed = True
+                archive_content = str(
+                    (refreshed_run or {}).get("error_message")
+                    or "PPT 编辑流程未成功完成"
+                )
+                yield make_event(
+                    ERROR,
+                    {"message": archive_content, "run_id": run_id},
+                )
+
+        except (WorkflowRunConflictError, PptOwnershipError) as exc:
+            logger.info("[WorkflowRunner/Edit 恢复] Run %s 不可恢复: %s", run_id, exc)
+            archive_failed = True
+            archive_content = str(exc)
+            yield make_event(
+                ERROR,
+                {"message": archive_content, "run_id": run_id},
+            )
+        except GraphRecursionError:
+            logger.exception(
+                "[WorkflowRunner/Edit 恢复] Run %s 超出最大递归步数",
+                run_id,
+            )
+            archive_failed = True
+            archive_content = "PPT 编辑恢复达到最大执行步数"
+            if execution_started:
+                await self._mark_run_failed_safely(
+                    run_id=run_id,
+                    user_id=user_id,
+                    error_code="GRAPH_RECURSION_LIMIT",
+                    error_message=archive_content,
+                )
+            yield make_event(
+                ERROR,
+                {"message": archive_content, "run_id": run_id},
+            )
+        except Exception as exc:
+            logger.exception("[WorkflowRunner/Edit 恢复] Run %s 执行异常", run_id)
+            archive_failed = True
+            archive_content = f"PPT 编辑恢复失败：{exc}"
+            if execution_started:
+                await self._mark_run_failed_safely(
+                    run_id=run_id,
+                    user_id=user_id,
+                    error_code="WORKFLOW_RESUME_EXCEPTION",
+                    error_message=str(exc),
+                )
+            yield make_event(
+                ERROR,
+                {"message": archive_content, "run_id": run_id},
+            )
+        finally:
+            if session_id and archive_content:
+                try:
+                    await self._archive_assistant_message(
+                        session_id=session_id,
+                        user_id=user_id,
+                        user_message_id=None,
+                        run_id=run_id,
+                        content=archive_content,
+                        message_type="ERROR" if archive_failed else "WORKFLOW_RESULT",
+                        message_status="FAILED" if archive_failed else "COMPLETED",
+                        metadata={
+                            "intent": "edit",
+                            "resume": True,
+                            "ppt_id": ppt_id,
+                        },
+                    )
+                except Exception:
+                    logger.exception(
+                        "[WorkflowRunner/Edit 恢复] Run %s 归档消息失败",
+                        run_id,
+                    )
+            if (
+                session_id
+                and original_message
+                and archive_content
+                and not archive_failed
+            ):
+                try:
+                    await self.memory.save(
+                        session_id,
+                        original_message,
+                        archive_content,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[WorkflowRunner/Edit 恢复] Run %s 保存会话记忆失败",
+                        run_id,
+                    )
+
+        yield make_event(
+            DONE,
+            {
+                "session_id": session_id,
+                "run_id": run_id,
+                "ppt_id": ppt_id,
+                "elapsed_seconds": round(time.monotonic() - started_at, 2),
+                "status": "FAILED" if archive_failed else "COMPLETED",
+            },
+        )
 
     async def run_create_resume_stream(
         self,
@@ -518,12 +715,12 @@ class WorkflowRunner:
         )
         run = context["run"]
         session_id = str(run["session_id"])
-        history = await self.memory.load(session_id)
+        conversation_history = await self.memory.load(session_id)
         return self._build_create_resume_state(
             user_id=user_id,
             run=context["run"],
             ppt=context["ppt"],
-            history=history,
+            conversation_history=conversation_history,
         )
 
     @staticmethod
@@ -531,23 +728,24 @@ class WorkflowRunner:
         user_message: str,
         session_id: str,
         style: str,
-        history: list,
+        conversation_history: list[BaseMessage],
         session_state: SessionState,
         requested_action: str | None,
         requested_ppt_id: str | None,
         user_id: int,
         run_id: str,
     ) -> WorkflowState:
-        """把用户请求和跨请求历史组装成 Graph 的初始 State。"""
+        """在进入 Graph 前固定本轮会话快照，并初始化全部业务字段。"""
         return {
+            # Redis history 只在本轮入口读取一次，不含当前 user_message。
+            "conversation_history": list(conversation_history),
+            # 当前请求单独保存，节点构建 Prompt 时再与 history 组合。
+            "user_message": user_message,
+            # 只有统一 Reply Node 负责写最终用户可见结果。
+            "final_response": None,
+            "final_response_mode": None,
             "user_id": user_id,
             "run_id": run_id,
-            "messages": [
-                SystemMessage(content=OVERVIEW_PROMPT),
-                *history,
-                HumanMessage(content=user_message),
-            ],
-            "user_message": user_message,
             "session_id": session_id,
             "style": style,
             "requested_ppt_id": requested_ppt_id,
@@ -555,6 +753,8 @@ class WorkflowRunner:
             "ppt_id": None,
             "ppt_context_error": None,
             "workflow_error": None,
+            "edit_target_matches_active": None,
+            "edit_target_match_reason": None,
             "outline": None,
             "research_report": None,
             "filename": None,
@@ -572,6 +772,7 @@ class WorkflowRunner:
             "next": None,
             "requested_action": requested_action,
             "intent": None,
+            "execute": False,
             "route_source": None,
             "route_confidence": None,
             "route_reason": None,
@@ -583,7 +784,7 @@ class WorkflowRunner:
         user_id: int,
         run: dict,
         ppt: dict,
-        history: list,
+        conversation_history: list[BaseMessage],
     ) -> WorkflowState:
         """把 workflow_run 的进度和 ppt_record 的产物还原为 Create State。"""
         ppt_id = str(run["ppt_id"])
@@ -605,7 +806,7 @@ class WorkflowRunner:
             user_message=user_message,
             session_id=session_id,
             style=style,
-            history=history,
+            conversation_history=conversation_history,
             session_state=SessionState(
                 active_ppt_id=ppt_id,
                 ppt_ids=[ppt_id],
@@ -640,6 +841,7 @@ class WorkflowRunner:
                     or current_stage == "FINALIZE"
                 ),
                 "intent": "create",
+                "execute": True,
                 "route_source": "explicit",
                 "route_confidence": 1.0,
                 "route_reason": "从 MySQL 恢复 Create Workflow",
@@ -710,11 +912,9 @@ class WorkflowRunner:
         )
 
     @staticmethod
-    def _last_ai_text(final_state: WorkflowState) -> str:
-        """从最终 State 取最后一条 Specialist AI 文本。"""
-        for message in reversed(final_state.get("messages", [])):
-            if isinstance(message, AIMessage) and not message.tool_calls:
-                text = str(message.text).strip()
-                if text:
-                    return text
+    def _final_response_text(final_state: WorkflowState) -> str:
+        """从 Reply Node 的显式输出字段取得最终用户回复。"""
+        response = final_state.get("final_response")
+        if isinstance(response, str) and response.strip():
+            return response.strip()
         return "任务执行完成，但没有生成文字回复。"
