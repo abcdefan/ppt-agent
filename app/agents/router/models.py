@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 Intent = Literal["chat", "create", "edit"]
 RouteSource = Literal["explicit", "embedding", "llm", "fallback"]
-RequestedAction = Literal["create", "edit"]
+RequestedAction = Literal["create"]
 
 
 @dataclass(slots=True)

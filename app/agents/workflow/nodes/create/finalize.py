@@ -33,6 +33,6 @@ async def finalize_create_node(state: WorkflowState) -> dict:
         workflow_error = f"Create 未完成必要产物：{'、'.join(missing)}"
 
     return {
-        "next": "FINISH",
+        "create_finalized": True,
         "workflow_error": workflow_error,
     }

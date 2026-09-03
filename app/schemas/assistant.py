@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-AssistantAction = Literal["create", "edit"]
+AssistantAction = Literal["create"]
 PptStyle = Literal["business", "creative", "academic", "minimalist"]
 
 
@@ -13,12 +13,7 @@ class AssistantStreamRequest(BaseModel):
     session_id: str | None = Field(default=None, description="会话 ID")
     requested_action: AssistantAction | None = Field(
         default=None,
-        description="前端明确指定的单次动作",
-    )
-    ppt_id: str | None = Field(
-        default=None,
-        min_length=1,
-        description="Edit 时可选的显式目标 PPT ID；缺省时使用当前活动 PPT",
+        description="前端创建模式显式指定的 create 意图",
     )
     style: PptStyle | None = Field(default=None, description="可选 PPT 风格")
 

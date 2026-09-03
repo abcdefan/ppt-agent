@@ -1,30 +1,12 @@
 """Edit Workflow 的动态规划与路由节点。"""
 
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, Field, model_validator
 
-from app.agents.workflow.state import AssetTask, WorkflowState
-
-EditStage = Literal[
-    "research",
-    "outline",
-    "content",
-    "planner",
-    "assets",
-    "beautify",
-]
-EditRoute = Literal[
-    "research",
-    "outline",
-    "content",
-    "planner",
-    "assets",
-    "beautify",
-    "FINISH",
-]
+from app.agents.workflow.state import AssetTask, EditRoute, WorkflowState
 
 EDIT_ROUTES: set[str] = {
     "research",
@@ -59,25 +41,25 @@ EDIT_SUPERVISOR_PROMPT = """你是 PPT 多智能体团队的 Edit Supervisor。
 6. 不要无理由重复已经执行成功的阶段；确认修改已经落到 PPT 后再 FINISH；
 7. 节点失败由工作流直接失败收尾，不由你进行节点级重试。
 
-严格返回 JSON，字段为 next、reason、asset_tasks。
+严格返回 JSON，字段为 edit_next、reason、asset_tasks。
 示例：
-{"next":"research","reason":"需要先获取用户要求的最新资料","asset_tasks":null}
-{"next":"assets","reason":"只需要替换页面配图","asset_tasks":["image"]}
-{"next":"FINISH","reason":"用户要求的修改已经写入 PPT","asset_tasks":null}
+{"edit_next":"research","reason":"需要先获取用户要求的最新资料","asset_tasks":null}
+{"edit_next":"assets","reason":"只需要替换页面配图","asset_tasks":["image"]}
+{"edit_next":"FINISH","reason":"用户要求的修改已经写入 PPT","asset_tasks":null}
 """
 
 
 class EditRouteDecision(BaseModel):
     """Edit Supervisor 每轮提议的下一步。"""
 
-    next: EditRoute = Field(description="下一阶段，或 FINISH")
+    edit_next: EditRoute = Field(description="Edit 下一阶段，或 FINISH")
     reason: str = Field(
         default="Edit Supervisor 未提供路由理由",
         description="选择该路由的一句话理由",
     )
     asset_tasks: list[AssetTask] | None = Field(
         default=None,
-        description="next=assets 时选择 image、chart 或两者，否则返回 null",
+        description="edit_next=assets 时选择 image、chart 或两者，否则返回 null",
     )
 
     @model_validator(mode="before")
@@ -86,8 +68,8 @@ class EditRouteDecision(BaseModel):
         if not isinstance(data, dict):
             return data
         normalized = dict(data)
-        if "next" not in normalized and "next_stage" in normalized:
-            normalized["next"] = normalized.pop("next_stage")
+        if "edit_next" not in normalized and "next_stage" in normalized:
+            normalized["edit_next"] = normalized.pop("next_stage")
         if not normalized.get("reason"):
             normalized["reason"] = "Edit Supervisor 未提供路由理由"
         return normalized
@@ -100,7 +82,7 @@ def normalize_asset_tasks(proposed: list[AssetTask] | None) -> list[AssetTask]:
 
 
 def route_after_edit_supervisor(state: WorkflowState) -> EditRoute:
-    next_route = state.get("next")
+    next_route = state.get("edit_next")
     return cast(EditRoute, next_route) if next_route in EDIT_ROUTES else "FINISH"
 
 
@@ -146,10 +128,10 @@ def build_edit_supervisor_node(llm: BaseChatModel):
         )
 
         patch: dict[str, Any] = {
-            "next": decision.next,
+            "edit_next": decision.edit_next,
             "route_reason": decision.reason,
         }
-        if decision.next == "assets":
+        if decision.edit_next == "assets":
             proposed_tasks = (
                 decision.asset_tasks
                 if decision.asset_tasks is not None

@@ -11,6 +11,7 @@ from app.controller import assistant_router, chat_router, user_router
 from app.core.config import settings
 from app.core.database import database
 from app.core.exceptions import BusinessException, ErrorCode
+from app.core.observability import setup_observability
 from app.core.redis import redis_client
 from app.schemas.common import BaseResponse
 
@@ -29,6 +30,10 @@ async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     # 在这里运行整个 FastAPI 应用
     # 启动时执行
+    # 必须先于 WorkflowRunner/MasterAgent 的导入和实例化，让其内部创建的
+    # LangChain、LangGraph、LLM 与 Tool 自动继承 LangSmith tracing 配置。
+    setup_observability()
+
     await database.connect()
     print(f"数据库连接成功: {settings.db_host}:{settings.db_port}/{settings.db_name}")
 

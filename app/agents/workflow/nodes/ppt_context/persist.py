@@ -30,13 +30,21 @@ def build_persist_node(
         required_stages = list(state.get("required_stages", []))
         state_filename = state.get("filename")
         filename = Path(state_filename).name if state_filename else None
-        is_final = state.get("next") == "FINISH"
-        current_route = state.get("next")
+        is_create_final = (
+            state.get("intent") == "create"
+            and state.get("create_finalized") is True
+        )
+        is_edit_final = (
+            state.get("intent") == "edit"
+            and state.get("edit_next") == "FINISH"
+        )
+        is_final = is_create_final or is_edit_final
+        current_route = state.get("edit_next")
         if is_final:
             current_stage = "FINALIZE"
         elif state.get("intent") == "edit" and current_route:
             # Edit 加载的是 PPT 历史产物集合；本轮实际完成的阶段就是
-            # Supervisor 最近选择、随后汇聚到 Persist 的 next。
+            # Supervisor 最近选择、随后汇聚到 Persist 的 edit_next。
             current_stage = current_route.upper()
         else:
             current_stage = (
@@ -77,6 +85,17 @@ def build_persist_node(
 
 
 def route_after_persist(state: WorkflowState) -> str:
-    if state.get("workflow_error") or state.get("next") == "FINISH":
+    if (
+        state.get("ppt_context_error")
+        or state.get("workflow_error")
+        or (
+            state.get("intent") == "create"
+            and state.get("create_finalized") is True
+        )
+        or (
+            state.get("intent") == "edit"
+            and state.get("edit_next") == "FINISH"
+        )
+    ):
         return "finish"
     return "continue"

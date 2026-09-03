@@ -45,9 +45,6 @@ async def assistant_stream(
                 session_id=session_id,
                 requested_action=req.requested_action,
                 style=req.style,
-                # 请求中的 ppt_id 只是 Edit 可选的已有目标，不是 Create
-                # 即将生成的新 PPT ID；进入 Workflow 后统一使用该名称。
-                requested_ppt_id=req.ppt_id,
                 user_id=user_id,
                 run_id=run_id,
             ):

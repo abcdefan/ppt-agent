@@ -313,7 +313,7 @@ def _build_create_subgraph(
         {"retry": BEAUTIFY_NODE, "finalize": FINALIZE_CREATE_NODE},
     )
     # Finalize 只负责校验最小产物并写 FINISH 终态；真正落库在随后的最终
-    # persist：有 workflow_error 记为 failed，否则 next==FINISH 记为 completed。
+    # persist：有 workflow_error 记为 failed，否则 create_finalized 记为 completed。
     # 该校验并非无效：Content 等阶段工具静默失败（无异常但无产物）时，
     # 正是这里的 missing 检查兜底生成 workflow_error。
     builder.add_edge(

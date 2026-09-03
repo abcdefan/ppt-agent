@@ -40,11 +40,17 @@ class Settings(BaseSettings):
     dashscope_api_key: str
     dashscope_embedding_model: str
     dashscope_embedding_batch_size: int = 10
+    # 意图embedding
     intent_embedding_min_score: float = 0.72
     intent_embedding_margin: float = 0.08
     # Tavily 联网检索。留空时 Research 的搜索能力明确降级；已知 URL
     # 仍可由 fetch_url 使用 httpx 读取。
     tavily_api_key: str
+    # langsmith
+    langsmith_tracing: bool
+    langsmith_api_key: str
+    langsmith_project: str
+    langsmith_endpoint: str
     # 文件存储目录
     workspace_dir: str = "workspace"
     # 智能体配置

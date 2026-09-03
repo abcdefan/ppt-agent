@@ -44,8 +44,8 @@ def build_initialize_node(
             "active_ppt_id": ppt_id,
             "ppt_context_error": None,
             "workflow_error": None,
-            "outline": None,
             "research_report": None,
+            "outline": None,
             "filename": None,
             "slides_manifest": None,
             "style": style,
@@ -58,9 +58,10 @@ def build_initialize_node(
             # 可选增强阶段并冻结。
             "required_stages": ["research", "outline", "content"],
             "requirements_initialized": False,
+            "create_finalized": False,
             "attempt_error": None,
             "attempt_counts": {},
-            "next": None,
+            "edit_next": None,
         }
 
     return initialize_ppt

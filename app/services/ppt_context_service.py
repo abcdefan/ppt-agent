@@ -171,7 +171,6 @@ class PptContextService:
                 input_payload={
                     "message": message,
                     "style": style,
-                    "requested_ppt_id": None,
                 },
             )
         return {"ppt": ppt, "run": run}
@@ -183,7 +182,7 @@ class PptContextService:
         session_id: str,
         run_id: str,
         message: str,
-        requested_ppt_id: str | None = None,
+        target_ppt_id: str | None = None,
         waiting_payload: dict[str, Any] | None = None,
         checkpoint_thread_id: str | None = None,
         graph_version: str = "v1",
@@ -196,25 +195,25 @@ class PptContextService:
                 title=self._default_session_title(message),
             )
             ppt = None
-            if requested_ppt_id is not None:
+            if target_ppt_id is not None:
                 ppt = await self.get_editable_ppt(
-                    ppt_id=requested_ppt_id,
+                    ppt_id=target_ppt_id,
                     user_id=user_id,
                 )
                 if ppt is None:
                     raise PptOwnershipError(
                         f"PPT 不存在、不属于当前用户或尚不可编辑: "
-                        f"{requested_ppt_id}"
+                        f"{target_ppt_id}"
                     )
                 await self.session_ppt_repository.link(
                     session_id=session_id,
-                    ppt_id=requested_ppt_id,
+                    ppt_id=target_ppt_id,
                     association_source="SELECTED",
                 )
                 if not await self.session_repository.set_active_ppt(
                     session_id=session_id,
                     user_id=user_id,
-                    ppt_id=requested_ppt_id,
+                    ppt_id=target_ppt_id,
                 ):
                     raise RuntimeError(f"无法设置 Session 活动 PPT: {session_id}")
 
@@ -222,7 +221,7 @@ class PptContextService:
                 run_id=run_id,
                 user_id=user_id,
                 session_id=session_id,
-                ppt_id=requested_ppt_id,
+                ppt_id=target_ppt_id,
                 intent="EDIT",
                 status="RUNNING",
                 required_stages=[],
@@ -230,15 +229,15 @@ class PptContextService:
                 graph_version=graph_version,
                 input_payload={
                     "message": message,
-                    "requested_ppt_id": requested_ppt_id,
+                    "target_ppt_id": target_ppt_id,
                 },
             )
-            if requested_ppt_id is None:
+            if target_ppt_id is None:
                 if not await self.run_repository.mark_waiting(
                     run_id=run_id,
                     user_id=user_id,
                     waiting_type="PPT_TARGET_REQUIRED",
-                    waiting_payload=waiting_payload or {"requested_ppt_id": None},
+                    waiting_payload=waiting_payload or {},
                     current_stage="RESOLVE_TARGET",
                 ):
                     raise WorkflowRunConflictError(
@@ -276,7 +275,7 @@ class PptContextService:
                 session_id=session_id,
                 run_id=run_id,
                 message=message,
-                requested_ppt_id=None,
+                target_ppt_id=None,
                 waiting_payload=waiting_payload,
                 checkpoint_thread_id=checkpoint_thread_id,
                 graph_version=graph_version,

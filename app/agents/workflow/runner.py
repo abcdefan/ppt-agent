@@ -105,7 +105,6 @@ class WorkflowRunner:
         session_id: str | None = None,
         style: str | None = None,
         requested_action: str | None = None,
-        requested_ppt_id: str | None = None,
         run_id: str | None = None,
     ) -> str:
         """非流式执行一次完整 Workflow。"""
@@ -121,7 +120,6 @@ class WorkflowRunner:
             content=user_message,
             metadata={
                 "requested_action": requested_action,
-                "requested_ppt_id": requested_ppt_id,
             },
         )
         conversation_history = await self.memory.load(session_id)
@@ -133,7 +131,6 @@ class WorkflowRunner:
             conversation_history=conversation_history,
             session_state=session_state,
             requested_action=requested_action,
-            requested_ppt_id=requested_ppt_id,
             user_id=user_id,
             run_id=effective_run_id,
         )
@@ -214,7 +211,6 @@ class WorkflowRunner:
         session_id: str | None,
         style: str | None,
         requested_action: str | None,
-        requested_ppt_id: str | None,
         on_ppt_created: Callable[[str], Awaitable[None]] | None,
         user_id: int,
         run_id: str,
@@ -246,7 +242,6 @@ class WorkflowRunner:
                 content=user_message,
                 metadata={
                     "requested_action": requested_action,
-                    "requested_ppt_id": requested_ppt_id,
                 },
             )
             user_message_id = int(user_record["id"])
@@ -260,7 +255,6 @@ class WorkflowRunner:
                 conversation_history=conversation_history,
                 session_state=session_state,
                 requested_action=requested_action,
-                requested_ppt_id=requested_ppt_id,
                 user_id=user_id,
                 run_id=run_id,
             )
@@ -402,7 +396,6 @@ class WorkflowRunner:
         session_id: str | None = None,
         style: str | None = None,
         requested_action: str | None = None,
-        requested_ppt_id: str | None = None,
         run_id: str | None = None,
     ) -> AsyncIterator[dict]:
         """普通流式执行入口。"""
@@ -411,7 +404,6 @@ class WorkflowRunner:
             session_id=session_id,
             style=style,
             requested_action=requested_action,
-            requested_ppt_id=requested_ppt_id,
             on_ppt_created=None,
             user_id=user_id,
             run_id=run_id or f"run-{uuid4().hex}",
@@ -731,7 +723,6 @@ class WorkflowRunner:
         conversation_history: list[BaseMessage],
         session_state: SessionState,
         requested_action: str | None,
-        requested_ppt_id: str | None,
         user_id: int,
         run_id: str,
     ) -> WorkflowState:
@@ -748,15 +739,14 @@ class WorkflowRunner:
             "run_id": run_id,
             "session_id": session_id,
             "style": style,
-            "requested_ppt_id": requested_ppt_id,
             "active_ppt_id": session_state.active_ppt_id,
             "ppt_id": None,
             "ppt_context_error": None,
             "workflow_error": None,
             "edit_target_matches_active": None,
             "edit_target_match_reason": None,
-            "outline": None,
             "research_report": None,
+            "outline": None,
             "filename": None,
             "slides_manifest": None,
             "asset_operations": [],
@@ -767,9 +757,10 @@ class WorkflowRunner:
             "required_stages": [],
             "completed_stages": [],
             "requirements_initialized": False,
+            "create_finalized": False,
             "attempt_error": None,
             "attempt_counts": {},
-            "next": None,
+            "edit_next": None,
             "requested_action": requested_action,
             "intent": None,
             "execute": False,
@@ -812,7 +803,6 @@ class WorkflowRunner:
                 ppt_ids=[ppt_id],
             ),
             requested_action="create",
-            requested_ppt_id=None,
             user_id=user_id,
             run_id=run_id,
         )
@@ -820,8 +810,8 @@ class WorkflowRunner:
             {
                 "active_ppt_id": ppt_id,
                 "ppt_id": ppt_id,
-                "outline": ppt.get("outline_json"),
                 "research_report": ppt.get("research_report_json"),
+                "outline": ppt.get("outline_json"),
                 "filename": ppt.get("current_filename"),
                 "slides_manifest": ppt.get("slides_manifest_json"),
                 "asset_apply_status": (

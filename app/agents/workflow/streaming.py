@@ -192,7 +192,7 @@ async def stream_workflow_events(
 
         # 只放行 Reply Node 的模型文字；Router/Supervisor/Planner 的结构化 JSON
         # 和 Specialist 的内部协作内容都不发给前端。
-        # - Supervisor 输出的是 {"next": ...} 路由 JSON；
+        # - Supervisor 输出的是 {"edit_next": ...} 路由 JSON；
         # - Specialist 输出的是大纲 JSON、工具调用前说明和最终回复。
         # 这些都属于 Workflow 内部协作上下文，不转成前端
         # TEXT_DELTA。Create 的确定性完成文案不调用 LLM，会在下面的

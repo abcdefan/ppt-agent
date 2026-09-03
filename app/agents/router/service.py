@@ -87,11 +87,11 @@ class IntentRouterService:
         intent_confidence = None
         intent_reason = ""
 
-        if context.requested_action in {"create", "edit"}:
-            intent_hint = context.requested_action
+        if context.requested_action == "create":
+            intent_hint = "create"
             intent_source = "explicit"
             intent_confidence = 1.0
-            intent_reason = f"前端明确指定 {context.requested_action} 意图"
+            intent_reason = "前端明确指定 create 意图"
         else:
             await self.initialize()
 

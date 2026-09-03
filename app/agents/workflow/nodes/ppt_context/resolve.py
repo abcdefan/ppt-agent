@@ -211,8 +211,8 @@ def _state_patch(record: PptRecord) -> dict[str, Any]:
         "active_ppt_id": record.ppt_id,
         "ppt_context_error": None,
         "workflow_error": None,
-        "outline": record.outline,
         "research_report": record.research_report,
+        "outline": record.outline,
         "filename": record.filename,
         "slides_manifest": record.slides_manifest,
         "style": record.style,
@@ -224,9 +224,10 @@ def _state_patch(record: PptRecord) -> dict[str, Any]:
         "required_stages": [],
         "completed_stages": _available_stages(record),
         "requirements_initialized": False,
+        "create_finalized": False,
         "attempt_error": None,
         "attempt_counts": {},
-        "next": None,
+        "edit_next": None,
     }
 
 
@@ -295,7 +296,7 @@ def build_resolve_node(
                     session_id=session_id,
                     run_id=run_id,
                     message=user_message,
-                    requested_ppt_id=active_ppt_id,
+                    target_ppt_id=active_ppt_id,
                     checkpoint_thread_id=run_id,
                 )
             except PptOwnershipError:

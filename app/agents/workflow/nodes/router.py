@@ -31,14 +31,15 @@ def build_intent_router_node(router: IntentRouterService):
                     "workflow_error": None,
                     "edit_target_matches_active": None,
                     "edit_target_match_reason": None,
-                    "outline": None,
                     "research_report": None,
+                    "outline": None,
                     "filename": None,
                     "slides_manifest": None,
                     "asset_tasks": [],
                     "required_stages": [],
                     "requirements_initialized": False,
-                    "next": None,
+                    "create_finalized": False,
+                    "edit_next": None,
                 }
                 if decision.intent in {"create", "edit"} and decision.execute
                 else {}

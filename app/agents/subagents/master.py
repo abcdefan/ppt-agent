@@ -154,7 +154,6 @@ class MasterAgent:
         intent: str,
         session_id: str,
         session_state,
-        requested_ppt_id: str | None,
         style: str | None,
     ) -> tuple[PptRecord | None, str | None]:
         """让备用 Subagents 模式也遵守 Session 引用 + PptRecord 模型。"""
@@ -168,7 +167,7 @@ class MasterAgent:
             await self.state_store.add_ppt(session_id, record.ppt_id)
             return record, None
 
-        target_ppt_id = requested_ppt_id or session_state.active_ppt_id
+        target_ppt_id = session_state.active_ppt_id
         if not target_ppt_id:
             return None, "当前会话还没有可编辑的 PPT。"
         if target_ppt_id not in session_state.ppt_ids:
@@ -185,7 +184,6 @@ class MasterAgent:
         session_id: str | None = None,
         requested_action: str | None = None,
         style: str | None = None,
-        ppt_id: str | None = None,
     ) -> str:
         """非流式执行一次完整的 Master → Subagents 协作。"""
         session_id = session_id or "default"
@@ -218,7 +216,6 @@ class MasterAgent:
             intent=decision.intent,
             session_id=session_id,
             session_state=session_state,
-            requested_ppt_id=ppt_id,
             style=style,
         )
         if context_error or record is None:
@@ -264,7 +261,6 @@ class MasterAgent:
         on_ppt_created: Callable[[str], Awaitable[None]] | None,
         requested_action: str | None,
         style: str | None,
-        requested_ppt_id: str | None = None,
     ) -> AsyncIterator[dict]:
         """流式执行的公共实现，由两个公开流式入口复用。"""
         session_id = session_id or "default"
@@ -313,7 +309,6 @@ class MasterAgent:
                     intent=decision.intent,
                     session_id=session_id,
                     session_state=session_state,
-                    requested_ppt_id=requested_ppt_id,
                     style=style,
                 )
                 if context_error or record is None:
@@ -409,7 +404,6 @@ class MasterAgent:
         session_id: str | None = None,
         requested_action: str | None = None,
         style: str | None = None,
-        ppt_id: str | None = None,
     ) -> AsyncIterator[dict]:
         """普通对话的流式入口。"""
         async for event in self._stream(
@@ -418,7 +412,6 @@ class MasterAgent:
             on_ppt_created=None,
             requested_action=requested_action,
             style=style,
-            requested_ppt_id=ppt_id,
         ):
             yield event
 
